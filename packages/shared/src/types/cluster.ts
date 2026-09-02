@@ -5,7 +5,7 @@ import type { AuditFields, DocId, IsoDate } from './common';
  *
  * Un cluster è o **dinamico** (definito da un albero di regole valutato ad ogni
  * ricalcolo) o **statico** (elenco esplicito di contatti) o **importato** dal
- * sito (rispecchia un customer group di OpenCart/PrestaShop).
+ * sito (rispecchia un customer group di PrestaShop).
  */
 export type ClusterType = 'dynamic' | 'static' | 'site_group' | 'brevo_list';
 
@@ -101,7 +101,7 @@ export interface Cluster extends AuditFields {
   rules?: FilterGroup | null;
   /** Solo per `type === 'static'`. */
   contactIds?: DocId[];
-  /** Solo per `type === 'site_group'`: nome del gruppo su OpenCart/PrestaShop. */
+  /** Solo per `type === 'site_group'`: nome del gruppo cliente su PrestaShop. */
   siteGroupName?: string | null;
   /** Solo per `type === 'brevo_list'`. */
   brevoListId?: number | null;

@@ -1,28 +1,53 @@
 import type { IsoDate } from './common';
 
 /**
- * Sorgenti dati del sito AlphaInk.
+ * Sorgenti dati AlphaInk.
  *
- * - `opencart`  → negozio B2C su https://alphaink.net/store (OpenCart)
- * - `prestashop`→ negozio B2B su https://b2b.alphaink.net (PrestaShop Webservice)
- * - `csv`       → import manuale da file
- * - `manual`    → contatto inserito a mano dalla web app
- * - `brevo`     → contatto già presente su Brevo e importato all'indietro
+ * Entrambi i negozi girano su **PrestaShop**:
+ * - `prestashop_b2c` → https://alphaink.net       (vendita al pubblico)
+ * - `prestashop_b2b` → https://b2b.alphaink.net   (rivenditori)
+ *
+ * Possono essere due installazioni separate oppure due shop di una stessa
+ * installazione in modalità multistore: la configurazione supporta entrambi i
+ * casi (vedi `PrestaShopStoreSettings.multistoreShopId`).
  */
-export type SiteSource = 'opencart' | 'prestashop' | 'csv' | 'manual' | 'brevo';
+export type SiteSource = 'prestashop_b2c' | 'prestashop_b2b' | 'csv' | 'manual' | 'brevo';
 
-export const SITE_SOURCES: SiteSource[] = ['opencart', 'prestashop', 'csv', 'manual', 'brevo'];
+export const SITE_SOURCES: SiteSource[] = ['prestashop_b2c', 'prestashop_b2b', 'csv', 'manual', 'brevo'];
+
+/** Sorgenti che corrispondono a un negozio sincronizzabile. */
+export type StoreSource = Extract<SiteSource, 'prestashop_b2c' | 'prestashop_b2b'>;
+
+export const STORE_SOURCES: StoreSource[] = ['prestashop_b2c', 'prestashop_b2b'];
 
 export const SITE_SOURCE_LABELS: Record<SiteSource, string> = {
-  opencart: 'AlphaInk B2C (OpenCart)',
-  prestashop: 'AlphaInk B2B (PrestaShop)',
+  prestashop_b2c: 'AlphaInk B2C (alphaink.net)',
+  prestashop_b2b: 'AlphaInk B2B (b2b.alphaink.net)',
   csv: 'Import CSV',
   manual: 'Inserimento manuale',
   brevo: 'Brevo',
 };
 
-/** Modalità di accesso ai dati OpenCart. */
-export type OpenCartMode = 'rest' | 'mysql';
+/** Segmento commerciale di default per ciascun negozio. */
+export const STORE_DEFAULT_SEGMENT: Record<StoreSource, 'b2c' | 'b2b'> = {
+  prestashop_b2c: 'b2c',
+  prestashop_b2b: 'b2b',
+};
+
+/**
+ * Modalità di accesso ai dati PrestaShop.
+ *
+ * - `webservice`: API REST/XML ufficiale (`/api/...`). Semplice da attivare, ma
+ *   lenta sui grandi volumi.
+ * - `mysql`: lettura diretta in sola lettura dal database. Molto più veloce per
+ *   il backfill iniziale del catalogo clienti/ordini di AlphaInk.
+ */
+export type PrestaShopMode = 'webservice' | 'mysql';
+
+export const PRESTASHOP_MODE_LABELS: Record<PrestaShopMode, string> = {
+  webservice: 'Webservice PrestaShop (API)',
+  mysql: 'Database MySQL (sola lettura)',
+};
 
 /** Entità sincronizzabili dal sito. */
 export type SyncEntity = 'customers' | 'orders' | 'carts' | 'products' | 'categories' | 'coupons' | 'customer_groups';

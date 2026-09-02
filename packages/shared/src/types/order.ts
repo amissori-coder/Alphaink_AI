@@ -85,7 +85,7 @@ export interface IssuedCoupon extends AuditFields {
   restrictToFamilies?: string[];
   issuedAt: IsoDate;
   expiresAt: IsoDate;
-  /** Sincronizzato sul sito (OpenCart/PrestaShop). */
+  /** Sincronizzato sul sito come `cart_rule` PrestaShop. */
   siteCouponId?: string | null;
   siteSyncError?: string | null;
   redeemedAt?: IsoDate | null;

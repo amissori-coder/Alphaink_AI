@@ -1,7 +1,12 @@
 import type {
   EmailDocument, EmailGlobalStyles, EmailSection, Spacing, TypographyStyle,
 } from '../types/email';
-import type { BrandingSettings, TrackingSettings } from '../types/settings';
+import type {
+  BrandingSettings, PrestaShopStoreSettings, SiteSettings, TrackingSettings,
+} from '../types/settings';
+import type { OrderStatus, StoreSource } from '../types/site';
+import { SITE_SOURCE_LABELS, STORE_DEFAULT_SEGMENT } from '../types/site';
+import { DEFAULT_FAMILY_RULES, DEFAULT_REPURCHASE_CYCLE_DAYS } from '../utils/family';
 import { DEFAULT_ATTRIBUTION_SETTINGS } from '../types/tracking';
 
 /**
@@ -167,3 +172,76 @@ export const LIMITS = {
   maxTestRecipients: 10,
   previewSampleSize: 25,
 } as const;
+
+// -----------------------------------------------------------------------------
+// PrestaShop — default dei due negozi AlphaInk
+// -----------------------------------------------------------------------------
+
+/**
+ * Mappa degli stati ordine PrestaShop "di fabbrica" (tabella `ps_order_state`)
+ * verso gli stati normalizzati dell'applicazione.
+ *
+ * Gli id degli stati sono personalizzabili in PrestaShop e AlphaInk potrebbe
+ * averne aggiunti: questa mappa è solo il punto di partenza, l'operatore la
+ * corregge da Impostazioni → Sito senza toccare il codice.
+ */
+export const DEFAULT_PRESTASHOP_ORDER_STATES: Record<string, OrderStatus> = {
+  '1': 'awaiting_payment',  // In attesa del pagamento con assegno
+  '2': 'paid',              // Pagamento accettato
+  '3': 'processing',        // Preparazione in corso
+  '4': 'shipped',           // Spedito
+  '5': 'completed',         // Consegnato
+  '6': 'cancelled',         // Annullato
+  '7': 'refunded',          // Rimborsato
+  '8': 'failed',            // Errore di pagamento
+  '9': 'processing',        // In attesa di rifornimento (pagato)
+  '10': 'awaiting_payment', // In attesa di bonifico bancario
+  '11': 'paid',             // Pagamento remoto accettato
+  '12': 'pending',          // In attesa di rifornimento (non pagato)
+  '13': 'awaiting_payment', // In attesa di validazione contrassegno
+};
+
+/** Configurazione predefinita di un negozio PrestaShop. */
+export function defaultStoreSettings(source: StoreSource): PrestaShopStoreSettings {
+  const isB2b = source === 'prestashop_b2b';
+  return {
+    source,
+    label: SITE_SOURCE_LABELS[source],
+    enabled: true,
+    baseUrl: isB2b ? 'https://b2b.alphaink.net' : 'https://alphaink.net',
+    mode: 'webservice',
+    credentialsConfigured: false,
+    multistoreShopId: null,
+    tablePrefix: 'ps_',
+    defaultSegment: STORE_DEFAULT_SEGMENT[source],
+    customerGroupMapping: isB2b
+      ? { Rivenditori: 'b2b', Grossisti: 'b2b', Visitatore: 'b2b', Ospite: 'b2b', Cliente: 'b2b' }
+      : { Visitatore: 'b2c', Ospite: 'b2c', Cliente: 'b2c' },
+    orderStateMapping: { ...DEFAULT_PRESTASHOP_ORDER_STATES },
+    /** 1 = italiano nelle installazioni PrestaShop italiane. */
+    languageId: 1,
+    lastSyncAt: null,
+    lastSyncError: null,
+  };
+}
+
+export const DEFAULT_SITE_SETTINGS: Omit<SiteSettings, 'createdAt' | 'updatedAt'> = {
+  stores: {
+    prestashop_b2c: defaultStoreSettings('prestashop_b2c'),
+    prestashop_b2b: defaultStoreSettings('prestashop_b2b'),
+  },
+  syncSchedule: {
+    enabled: true,
+    cron: '0 * * * *',
+    timezone: 'Europe/Rome',
+    entities: ['customer_groups', 'customers', 'orders', 'carts'],
+  },
+  familyRules: DEFAULT_FAMILY_RULES,
+  repurchaseCycleDays: { ...DEFAULT_REPURCHASE_CYCLE_DAYS },
+  /** Un ordine non pagato dopo 60 minuti fa scattare "Pagamento Abbandonato". */
+  abandonedPaymentAfterMinutes: 60,
+  /** Un carrello fermo da 4 ore è considerato abbandonato. */
+  abandonedCartAfterMinutes: 240,
+  webhookSecretConfigured: false,
+  defaultSource: 'prestashop_b2c',
+};

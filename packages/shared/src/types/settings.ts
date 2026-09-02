@@ -1,6 +1,6 @@
 import type { AuditFields, IsoDate } from './common';
 import type { AttributionSettings } from './tracking';
-import type { OpenCartMode, SiteSource } from './site';
+import type { OrderStatus, PrestaShopMode, StoreSource } from './site';
 
 /** Documento `settings/brevo`. La API key vive nei Secret Manager, non qui. */
 export interface BrevoSettings extends AuditFields {
@@ -47,28 +47,46 @@ export interface BrevoSender {
   active: boolean;
 }
 
+/**
+ * Configurazione di un singolo negozio PrestaShop.
+ *
+ * Le credenziali (chiave Webservice, password MySQL) NON vivono qui: stanno in
+ * Secret Manager. Su Firestore resta solo l'indicatore `credentialsConfigured`.
+ */
+export interface PrestaShopStoreSettings {
+  source: StoreSource;
+  label: string;
+  enabled: boolean;
+  baseUrl: string;
+  mode: PrestaShopMode;
+  credentialsConfigured: boolean;
+  /**
+   * Installazione in multistore: id dello shop da cui leggere.
+   * `null` quando l'installazione è dedicata (un solo shop).
+   */
+  multistoreShopId: number | null;
+  /** Prefisso delle tabelle nel database (default PrestaShop: `ps_`). */
+  tablePrefix: string;
+  /** Segmento assegnato ai contatti di questo negozio quando il gruppo non lo specifica. */
+  defaultSegment: 'b2c' | 'b2b';
+  /** Mappa "nome gruppo cliente PrestaShop" → segmento. */
+  customerGroupMapping: Record<string, 'b2c' | 'b2b'>;
+  /**
+   * Mappa "id stato ordine PrestaShop" → stato normalizzato.
+   * Gli id degli stati sono personalizzabili in PrestaShop, quindi la mappa è
+   * configurabile dalla UI invece che cablata nel codice.
+   */
+  orderStateMapping: Record<string, OrderStatus>;
+  /** Lingua PrestaShop usata per leggere nomi prodotto e categorie. */
+  languageId: number;
+  lastSyncAt?: IsoDate | null;
+  lastSyncError?: string | null;
+}
+
 /** Documento `settings/site`. Credenziali sensibili nei Secret Manager. */
 export interface SiteSettings extends AuditFields {
-  opencart: {
-    enabled: boolean;
-    baseUrl: string;
-    mode: OpenCartMode;
-    /** Solo indicatori: le credenziali non transitano dal client. */
-    credentialsConfigured: boolean;
-    tablePrefix: string;
-    /** Mappa gruppo cliente → segmento. */
-    customerGroupMapping: Record<string, 'b2c' | 'b2b'>;
-    lastSyncAt?: IsoDate | null;
-    lastSyncError?: string | null;
-  };
-  prestashop: {
-    enabled: boolean;
-    baseUrl: string;
-    credentialsConfigured: boolean;
-    customerGroupMapping: Record<string, 'b2c' | 'b2b'>;
-    lastSyncAt?: IsoDate | null;
-    lastSyncError?: string | null;
-  };
+  /** I due negozi AlphaInk, entrambi su PrestaShop. */
+  stores: Record<StoreSource, PrestaShopStoreSettings>;
   /** Frequenza della sincronizzazione automatica. */
   syncSchedule: {
     enabled: boolean;
@@ -81,8 +99,14 @@ export interface SiteSettings extends AuditFields {
   familyRules: FamilyRule[];
   /** Cicli di riacquisto stimati per famiglia (giorni). */
   repurchaseCycleDays: Record<string, number>;
+  /**
+   * Minuti dopo i quali un ordine non pagato è considerato "pagamento abbandonato".
+   */
+  abandonedPaymentAfterMinutes: number;
+  /** Minuti dopo i quali un carrello non convertito è considerato abbandonato. */
+  abandonedCartAfterMinutes: number;
   webhookSecretConfigured: boolean;
-  defaultSource: SiteSource;
+  defaultSource: StoreSource;
 }
 
 /** Regola di classificazione di un prodotto in una famiglia. */

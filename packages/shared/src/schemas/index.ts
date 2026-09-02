@@ -350,7 +350,7 @@ export const importContactsSchema = z.object({
 // --- Sincronizzazione sito --------------------------------------------------
 
 export const syncRequestSchema = z.object({
-  source: z.enum(['opencart', 'prestashop']),
+  source: z.enum(['prestashop_b2c', 'prestashop_b2b']),
   entities: z
     .array(z.enum(['customers', 'orders', 'carts', 'products', 'categories', 'coupons', 'customer_groups']))
     .min(1),
