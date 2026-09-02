@@ -1,0 +1,304 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* -----------------------------------------------------------------------------
+ * Design system AlphaInk — token colore in formato HSL "H S% L%"
+ * (senza wrapper hsl(): li applica tailwind.config.ts).
+ * Primario = ciano AlphaInk #00AEEF ≈ 197 100% 47%.
+ * -------------------------------------------------------------------------- */
+
+@layer base {
+  :root {
+    /* Superfici */
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    /* Brand */
+    --primary: 197 100% 47%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --accent: 328 100% 46%;
+    --accent-foreground: 0 0% 100%;
+
+    /* Stati */
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 160 84% 39%;
+    --success-foreground: 0 0% 100%;
+    --warning: 46 100% 50%;
+    --warning-foreground: 222 47% 11%;
+
+    /* Contorni e controlli */
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 197 100% 47%;
+    --radius: 0.625rem;
+
+    /* Barra laterale (sempre scura, anche in tema chiaro) */
+    --sidebar: 222 47% 11%;
+    --sidebar-foreground: 210 40% 96%;
+    --sidebar-accent: 217 33% 20%;
+    --sidebar-border: 217 33% 20%;
+
+    /* Tipografia (le variabili vere arrivano da next/font in layout.tsx) */
+    --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  .dark {
+    --background: 222 47% 8%;
+    --foreground: 210 40% 96%;
+    --card: 222 44% 11%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 44% 11%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 197 100% 50%;
+    --primary-foreground: 222 47% 8%;
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 96%;
+    --accent: 328 92% 56%;
+    --accent-foreground: 0 0% 100%;
+
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 160 74% 42%;
+    --success-foreground: 222 47% 8%;
+    --warning: 46 96% 54%;
+    --warning-foreground: 222 47% 8%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 22%;
+    --ring: 197 100% 50%;
+
+    --sidebar: 222 47% 6%;
+    --sidebar-foreground: 210 40% 92%;
+    --sidebar-accent: 217 33% 16%;
+    --sidebar-border: 217 33% 14%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Transizioni morbide sul cambio tema (non sui layout, per non rallentare). */
+  body,
+  .theme-transition {
+    transition:
+      background-color 180ms ease,
+      border-color 180ms ease,
+      color 180ms ease;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  ::selection {
+    background-color: hsl(var(--primary) / 0.22);
+    color: hsl(var(--foreground));
+  }
+
+  /* Anello di focus coerente su tutta l'app. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Scrollbar sottili */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border: 3px solid transparent;
+    border-radius: 9999px;
+    background-clip: padding-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.5);
+    background-clip: padding-box;
+  }
+
+  /* Nasconde le frecce dei campi numerici. */
+  input[type='number']::-webkit-outer-spin-button,
+  input[type='number']::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  input[type='number'] {
+    -moz-appearance: textfield;
+  }
+}
+
+@layer utilities {
+  /* Scrollbar ancora più discreta, per pannelli e liste dense. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border: 0;
+    border-radius: 9999px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.5);
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+}
+
+/* -----------------------------------------------------------------------------
+ * Canvas dell'editor email
+ * Il documento email è renderizzato su una "carta" centrata con sfondo a griglia,
+ * come in un editor visuale; i blocchi hanno stati hover/selezione dedicati.
+ * -------------------------------------------------------------------------- */
+
+.email-canvas {
+  background-color: hsl(var(--muted));
+  background-image:
+    linear-gradient(hsl(var(--border) / 0.55) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(var(--border) / 0.55) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-position: -1px -1px;
+  min-height: 100%;
+  padding: 2rem 1rem 6rem;
+  overflow-y: auto;
+}
+
+.email-canvas-sheet {
+  margin: 0 auto;
+  width: 100%;
+  max-width: 640px;
+  background-color: #ffffff;
+  border-radius: calc(var(--radius) + 2px);
+  box-shadow: 0 1px 3px 0 rgb(15 23 42 / 0.08), 0 18px 48px -20px rgb(15 23 42 / 0.35);
+  overflow: hidden;
+}
+
+/* Il contenuto email usa sempre colori chiari: neutralizza il dark mode. */
+.email-canvas-sheet,
+.email-canvas-sheet * {
+  color-scheme: light;
+}
+
+.email-block {
+  position: relative;
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+  transition: outline-color 120ms ease, background-color 120ms ease;
+}
+
+.email-block:hover {
+  outline-color: hsl(var(--primary) / 0.45);
+}
+
+.email-block[data-selected='true'] {
+  outline: 2px solid hsl(var(--primary));
+  outline-offset: -2px;
+}
+
+.email-block[data-dragging='true'] {
+  opacity: 0.55;
+}
+
+/* Indicatore del punto di rilascio nel drag & drop dei blocchi. */
+.email-drop-indicator {
+  height: 2px;
+  border-radius: 9999px;
+  background-color: hsl(var(--primary));
+  box-shadow: 0 0 0 3px hsl(var(--primary) / 0.18);
+}
+
+/* Barra degli strumenti fluttuante sopra il blocco selezionato. */
+.email-block-toolbar {
+  position: absolute;
+  top: -0.75rem;
+  right: 0.5rem;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0.125rem;
+  border-radius: calc(var(--radius) - 2px);
+  background-color: hsl(var(--popover));
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 12px 32px -8px rgb(15 23 42 / 0.24);
+}
+
+/* Effetto di caricamento condiviso da skeleton e placeholder. */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background-image: linear-gradient(
+    90deg,
+    transparent,
+    hsl(var(--foreground) / 0.06),
+    transparent
+  );
+  animation: shimmer 1.6s infinite;
+}
