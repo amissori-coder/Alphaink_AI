@@ -1,0 +1,31 @@
+{
+  "name": "alphaink-newsletter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AlphaInk Newsletter Suite — invio, automazioni, calendario e analytics newsletter con Brevo + Firebase",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "functions"
+  ],
+  "scripts": {
+    "build:shared": "npm run build --workspace=@alphaink/shared",
+    "dev": "npm run build:shared && npm run dev --workspace=@alphaink/web",
+    "build": "npm run build:shared && npm run build --workspace=@alphaink/web && npm run build --workspace=functions",
+    "build:web": "npm run build:shared && npm run build --workspace=@alphaink/web",
+    "build:functions": "npm run build:shared && npm run build --workspace=functions",
+    "lint": "npm run lint --workspace=@alphaink/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "emulators": "firebase emulators:start",
+    "deploy": "npm run build && firebase deploy",
+    "deploy:functions": "npm run build:functions && firebase deploy --only functions",
+    "deploy:rules": "firebase deploy --only firestore:rules,firestore:indexes,storage"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

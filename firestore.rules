@@ -1,0 +1,193 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Helper
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Il ruolo viaggia nei custom claims, impostati dalla Function `setUserRole`.
+    function role() {
+      return isSignedIn() ? request.auth.token.get('role', 'viewer') : 'none';
+    }
+
+    function rank(r) {
+      return r == 'owner' ? 50
+           : r == 'admin' ? 40
+           : r == 'editor' ? 30
+           : r == 'analyst' ? 20
+           : r == 'viewer' ? 10
+           : 0;
+    }
+
+    function atLeast(minimum) {
+      return isSignedIn() && rank(role()) >= rank(minimum);
+    }
+
+    function isActive() {
+      return isSignedIn() && request.auth.token.get('disabled', false) == false;
+    }
+
+    function canRead() {
+      return isActive() && atLeast('viewer');
+    }
+
+    // Campi che nessun client può modificare: sono di competenza delle Functions.
+    function noStatsTampering() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny(['stats', 'engagement', 'brevoCampaignId', 'brevoContactId',
+                 'contactCount', 'sendableCount', 'lastComputedAt']);
+    }
+
+    // -------------------------------------------------------------------------
+    // Utenti
+    // -------------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isActive() && (request.auth.uid == userId || atLeast('admin'));
+      // Il ruolo si cambia solo tramite la callable `setUserRole` (Admin SDK).
+      allow update: if isActive() && request.auth.uid == userId
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                         .hasAny(['role', 'disabled', 'createdAt']);
+      allow create, delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Contatti — scrittura riservata ad admin; la sincronizzazione passa da Functions
+    // -------------------------------------------------------------------------
+    match /contacts/{contactId} {
+      allow read: if canRead();
+      allow create, update: if atLeast('admin') && noStatsTampering();
+      allow delete: if atLeast('admin');
+    }
+
+    // -------------------------------------------------------------------------
+    // Cluster
+    // -------------------------------------------------------------------------
+    match /clusters/{clusterId} {
+      allow read: if canRead();
+      allow create: if atLeast('editor');
+      allow update: if atLeast('editor') && noStatsTampering();
+      allow delete: if atLeast('admin');
+    }
+
+    // -------------------------------------------------------------------------
+    // Newsletter — le bozze si modificano dalla UI, l'invio passa dalle Functions
+    // -------------------------------------------------------------------------
+    match /newsletters/{newsletterId} {
+      allow read: if canRead();
+      allow create: if atLeast('editor');
+      allow update: if atLeast('editor')
+                    && noStatsTampering()
+                    // Lo stato di invio è governato dalle Functions.
+                    && (resource.data.status in ['draft', 'scheduled', 'paused', 'failed', 'cancelled'])
+                    && (request.resource.data.status in ['draft', 'scheduled', 'paused', 'cancelled']);
+      allow delete: if atLeast('admin') && resource.data.status in ['draft', 'cancelled', 'failed'];
+
+      match /recipients/{recipientId} {
+        allow read: if canRead();
+        allow write: if false; // solo Admin SDK
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Template
+    // -------------------------------------------------------------------------
+    match /templates/{templateId} {
+      allow read: if canRead();
+      allow create: if atLeast('editor');
+      allow update: if atLeast('editor');
+      allow delete: if atLeast('admin') && resource.data.isSystem == false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Automazioni — configurabili da admin, eseguite dalle Functions
+    // -------------------------------------------------------------------------
+    match /automations/{automationId} {
+      allow read: if canRead();
+      allow create: if atLeast('admin');
+      allow update: if atLeast('admin') && noStatsTampering();
+      // Le automazioni core non sono eliminabili.
+      allow delete: if atLeast('owner') && resource.data.isCore == false;
+
+      match /runs/{runId} {
+        allow read: if canRead();
+        allow write: if false; // solo Admin SDK
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Dati operativi in sola lettura per la UI
+    // -------------------------------------------------------------------------
+    match /orders/{orderId} {
+      allow read: if canRead();
+      allow write: if false;
+    }
+
+    match /abandonedCarts/{cartId} {
+      allow read: if canRead();
+      allow write: if false;
+    }
+
+    match /coupons/{couponId} {
+      allow read: if canRead();
+      allow write: if false;
+    }
+
+    match /events/{eventId} {
+      allow read: if atLeast('analyst');
+      allow write: if false;
+    }
+
+    match /attributionTouches/{touchId} {
+      allow read: if atLeast('analyst');
+      allow write: if false;
+    }
+
+    match /syncJobs/{jobId} {
+      allow read: if canRead();
+      allow write: if false;
+    }
+
+    match /sendQueue/{batchId} {
+      allow read: if atLeast('admin');
+      allow write: if false;
+    }
+
+    match /metricsDaily/{dayId} {
+      allow read: if canRead();
+      allow write: if false;
+    }
+
+    match /activityLog/{logId} {
+      allow read: if atLeast('admin');
+      allow write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Media
+    // -------------------------------------------------------------------------
+    match /mediaAssets/{assetId} {
+      allow read: if canRead();
+      allow create: if atLeast('editor');
+      allow update: if atLeast('editor');
+      allow delete: if atLeast('admin');
+    }
+
+    // -------------------------------------------------------------------------
+    // Impostazioni — i segreti non sono mai memorizzati qui
+    // -------------------------------------------------------------------------
+    match /settings/{docId} {
+      allow read: if canRead();
+      allow write: if atLeast('admin');
+    }
+
+    // Tutto il resto è negato.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

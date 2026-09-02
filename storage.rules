@@ -1,0 +1,55 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return request.auth.token.role;
+    }
+
+    function canWriteMedia() {
+      return isSignedIn() && role() in ['owner', 'admin', 'editor'];
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function withinSizeLimit() {
+      return request.resource.size < 8 * 1024 * 1024;
+    }
+
+    // Immagini usate nelle newsletter: lettura pubblica (i client email non
+    // sono autenticati), scrittura riservata a editor e superiori.
+    match /media/{allPaths=**} {
+      allow read: if true;
+      allow write: if canWriteMedia() && isImage() && withinSizeLimit();
+      allow delete: if isSignedIn() && role() in ['owner', 'admin'];
+    }
+
+    // Anteprime generate dalle Functions.
+    match /thumbnails/{allPaths=**} {
+      allow read: if true;
+      allow write: if false; // solo Admin SDK
+    }
+
+    // File di import/export: accessibili solo agli utenti autenticati.
+    match /imports/{allPaths=**} {
+      allow read: if isSignedIn() && role() in ['owner', 'admin'];
+      allow write: if isSignedIn() && role() in ['owner', 'admin'] && withinSizeLimit();
+    }
+
+    match /exports/{allPaths=**} {
+      allow read: if isSignedIn() && role() in ['owner', 'admin', 'analyst'];
+      allow write: if false; // solo Admin SDK
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
