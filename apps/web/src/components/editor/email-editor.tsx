@@ -263,16 +263,37 @@ function EditorShell({
         );
         return;
       }
-      // Blocco esistente: si crea la sezione e poi vi si sposta dentro il blocco.
-      const section = createSection({ spans: [12] });
+      // Blocco esistente: la sezione nasce già con il blocco dentro e il
+      // documento viene sostituito in un passo solo. Creare la sezione e poi
+      // spostarvi il blocco produrrebbe due voci di cronologia per un solo
+      // gesto, e il primo annullamento lascerebbe nel documento la sezione
+      // vuota appena creata.
+      const found = findBlock(state.document, source.blockId);
+      if (!found) return;
+      const section = createSection({ spans: [12], blocks: [[found.block]] });
       const column = section.columns[0];
       if (!column) return;
-      actions.addSection(target.index, section);
-      actions.moveBlock(source.blockId, {
-        sectionId: section.id,
-        columnId: column.id,
-        index: 0,
-      });
+
+      const sections = state.document.sections.map((current) =>
+        current.id === found.location.sectionId
+          ? {
+              ...current,
+              columns: current.columns.map((candidate) =>
+                candidate.id === found.location.columnId
+                  ? {
+                      ...candidate,
+                      blocks: candidate.blocks.filter((block) => block.id !== source.blockId),
+                    }
+                  : candidate,
+              ),
+            }
+          : current,
+      );
+      // La rimozione non cambia il numero di sezioni: l'indice di rilascio resta valido.
+      sections.splice(Math.max(0, Math.min(target.index, sections.length)), 0, section);
+
+      actions.replaceDocument({ ...state.document, sections });
+      actions.selectBlock(found.block.id, section.id, column.id);
     }
   };
 

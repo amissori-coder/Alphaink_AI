@@ -37,8 +37,17 @@
  * - **Tocchi consumati**: un tocco attribuito a un ordine non viene riusato per
  *   un altro, così due acquisti ravvicinati non raddoppiano il merito della
  *   stessa email.
+ * - **Un ordine è un ordine**: i pesi del modello multi-touch ripartiscono
+ *   ordine e fatturato fra gli invii coinvolti (le attribuzioni si raggruppano
+ *   per destinazione prima di toccare i contatori) e la somma delle quote di
+ *   fatturato è esattamente il valore attribuibile dell'ordine.
+ * - **Più acquisti per destinatario**: le conversioni vivono in un elenco sul
+ *   destinatario (`conversions`), da cui `recomputeNewsletterStats` ricostruisce
+ *   ordini e fatturato: la riconciliazione oraria e l'attribuzione dicono la
+ *   stessa cosa anche quando lo stesso contatto compra due volte.
  * - **Reso e annullamento**: `revokeAttribution` sottrae il fatturato quando
- *   `subtractRefunds` è attivo e riporta il destinatario allo stato precedente.
+ *   `subtractRefunds` è attivo e cancella dal destinatario **solo** la
+ *   conversione dell'ordine revocato, senza mai portare i contatori sotto zero.
  */
 
 import { onDocumentWritten } from 'firebase-functions/v2/firestore';
@@ -59,7 +68,13 @@ import type {
 import { LIGHT_RUNTIME, REGION } from '../lib/config';
 import { FieldValue, col, db, logActivity, nowIso, serializeDoc, withId } from '../lib/firestore';
 import { createLogger } from '../lib/logger';
-import { findRecipientInNewsletter, statsPatch } from './processor';
+import {
+  conversionsPatch,
+  findRecipientInNewsletter,
+  readRecipientConversions,
+  statsPatch,
+} from './processor';
+import type { RecipientConversion } from './processor';
 import { readAttributionSettings } from './settings';
 
 const log = createLogger('tracking.attribution');
@@ -92,6 +107,33 @@ export function attributableRevenue(order: Order, settings: AttributionSettings)
   const total = Number(order.total ?? 0);
   const refunded = settings.subtractRefunds ? Number(order.refundedAmount ?? 0) : 0;
   return Math.max(0, Math.round((total - refunded) * 100) / 100);
+}
+
+/**
+ * Divide un importo secondo i pesi indicati, al centesimo.
+ *
+ * L'ultima quota assorbe il resto: arrotondando ogni quota per conto suo la
+ * somma si scosta dal totale (con sette tocchi 0,1429 × 7 = 1,0003) e la
+ * newsletter incasserebbe più del valore dell'ordine. Così la somma delle quote
+ * è esattamente l'importo attribuibile, qualunque sia il numero di tocchi.
+ */
+export function distributeAmount(total: number, weights: number[]): number[] {
+  if (weights.length === 0) return [];
+  const cents = Math.round(total * 100);
+  const shares: number[] = [];
+  let assigned = 0;
+
+  weights.forEach((weight, index) => {
+    if (index === weights.length - 1) {
+      shares.push(Math.max(0, cents - assigned) / 100);
+      return;
+    }
+    const share = Math.max(0, Math.round(cents * (Number.isFinite(weight) ? weight : 0)));
+    assigned += share;
+    shares.push(share / 100);
+  });
+
+  return shares;
 }
 
 // -----------------------------------------------------------------------------
@@ -185,7 +227,11 @@ export function selectTouches(
       const pool = sortedClicks.length > 0 ? sortedClicks : sortedOpens;
       if (pool.length === 0) return { touches: [], weights: [] };
       const weight = Math.round((1 / pool.length) * 10_000) / 10_000;
-      return { touches: pool, weights: pool.map(() => weight) };
+      const weights = pool.map(() => weight);
+      // L'ultimo peso assorbe il resto dell'arrotondamento: la somma deve
+      // restare esattamente 1, altrimenti un ordine varrebbe più di se stesso.
+      weights[weights.length - 1] = Math.round((1 - weight * (pool.length - 1)) * 10_000) / 10_000;
+      return { touches: pool, weights };
     }
     case 'coupon':
     default:
@@ -225,7 +271,7 @@ function attributionFromTouch(
   order: Order,
   model: AttributionModel,
   weight: number,
-  revenue: number,
+  attributedRevenue: number,
 ): OrderAttribution {
   return {
     model,
@@ -239,7 +285,7 @@ function attributionFromTouch(
     hoursToConversion: hoursBetween(touch.occurredAt, order.placedAt),
     couponCode: order.couponCode ?? null,
     utm: order.utm ?? null,
-    attributedRevenue: Math.round(revenue * weight * 100) / 100,
+    attributedRevenue: Math.round(attributedRevenue * 100) / 100,
     attributedAt: nowIso(),
   };
 }
@@ -281,23 +327,126 @@ function statusWithoutConversion(data: Record<string, unknown>): RecipientStatus
 }
 
 /**
+ * Destinazione su cui ricadono ordini e fatturato di una o più attribuzioni.
+ *
+ * `weight` è la quota di ordine spettante all'invio: nel modello lineare i pesi
+ * dei tocchi si sommano qui, così la stessa newsletter non riceve un ordine per
+ * ogni click ricevuto.
+ */
+export interface ConversionTarget {
+  newsletterId: string | null;
+  automationId: string | null;
+  automationRunId: string | null;
+  weight: number;
+  revenue: number;
+}
+
+/** Chiave di raggruppamento di una destinazione. */
+function targetKey(target: ConversionTarget): string {
+  return target.newsletterId
+    ? `n:${target.newsletterId}`
+    : `a:${target.automationId ?? '-'}:${target.automationRunId ?? '-'}`;
+}
+
+/**
+ * Raggruppa le attribuzioni di un ordine per invio di destinazione.
+ *
+ * Un ordine è **un** ordine: i pesi del modello multi-touch lo ripartiscono fra
+ * gli invii, non lo moltiplicano. Senza il raggruppamento tre click sulla stessa
+ * newsletter le farebbero contare tre ordini (e la riconciliazione, che conta i
+ * destinatari, direbbe il contrario).
+ */
+export function groupByTarget(attributions: OrderAttribution[]): ConversionTarget[] {
+  const groups = new Map<string, ConversionTarget>();
+
+  for (const attribution of attributions) {
+    const newsletterId = attribution.newsletterId ?? null;
+    const automationId = newsletterId ? null : (attribution.automationId ?? null);
+    if (!newsletterId && !automationId) continue;
+
+    const parsedWeight = Number(attribution.weight);
+    const weight = Number.isFinite(parsedWeight) && parsedWeight > 0 ? parsedWeight : 1;
+    const revenue = Number(attribution.attributedRevenue ?? 0);
+    const target: ConversionTarget = {
+      newsletterId,
+      automationId,
+      automationRunId: newsletterId ? null : (attribution.automationRunId ?? null),
+      weight,
+      revenue,
+    };
+
+    const existing = groups.get(targetKey(target));
+    if (!existing) {
+      groups.set(targetKey(target), target);
+      continue;
+    }
+    existing.weight = Math.round((existing.weight + weight) * 10_000) / 10_000;
+    existing.revenue = Math.round((existing.revenue + revenue) * 100) / 100;
+  }
+
+  return [...groups.values()];
+}
+
+/**
+ * Delta da applicare ai contatori aggregati.
+ *
+ * In revoca la sottrazione è limitata a quanto risulta effettivamente
+ * conteggiato: la revoca può arrivare dopo un ricalcolo che non aveva visto la
+ * conversione (destinatario non trovato, email diversa da quella dell'invio) e
+ * un `increment` negativo lascerebbe ordini e fatturato sotto zero.
+ */
+function conversionDelta(
+  current: { orders: number; revenue: number },
+  target: ConversionTarget,
+  sign: 1 | -1,
+): { orders: number; revenue: number } {
+  if (sign > 0) {
+    return {
+      orders: Math.round(target.weight * 10_000) / 10_000,
+      revenue: Math.round(target.revenue * 100) / 100,
+    };
+  }
+  const orders = Math.min(Math.max(0, Number(current.orders ?? 0)), target.weight);
+  const revenue = Math.min(Math.max(0, Number(current.revenue ?? 0)), target.revenue);
+  return {
+    orders: -(Math.round(orders * 10_000) / 10_000),
+    revenue: -(Math.round(revenue * 100) / 100),
+  };
+}
+
+/** Elenco delle conversioni dopo l'aggiunta o la rimozione di questo ordine. */
+function nextConversions(
+  current: RecipientConversion[],
+  order: Order,
+  target: ConversionTarget,
+  sign: 1 | -1,
+): RecipientConversion[] {
+  // Si toglie sempre la conversione di **questo** ordine (e solo quella): in
+  // aggiunta perché una ri-attribuzione forzata non la duplichi, in revoca
+  // perché gli altri acquisti dello stesso destinatario restino intatti.
+  const others = current.filter((conversion) => conversion.orderId !== order.id);
+  if (sign < 0) return others;
+  return [
+    ...others,
+    { orderId: order.id, at: order.placedAt, revenue: target.revenue, weight: target.weight },
+  ];
+}
+
+/**
  * Somma (o sottrae) ordini e fatturato su newsletter/automazione e sul
  * destinatario corrispondente.
  *
  * `sign` vale +1 in attribuzione e -1 in revoca.
  */
 async function applyConversion(
-  attribution: OrderAttribution,
+  target: ConversionTarget,
   order: Order,
   sign: 1 | -1,
 ): Promise<void> {
-  const revenue = Math.round(attribution.attributedRevenue * sign * 100) / 100;
-  const orders = sign;
-
-  if (attribution.newsletterId) {
-    const newsletterRef = col.newsletters().doc(attribution.newsletterId);
+  if (target.newsletterId) {
+    const newsletterRef = col.newsletters().doc(target.newsletterId);
     const recipientRef = await findRecipientInNewsletter(
-      attribution.newsletterId,
+      target.newsletterId,
       order.contactId ?? null,
       normalizeEmail(order.emailNormalized || order.email),
     );
@@ -308,30 +457,24 @@ async function applyConversion(
       if (!newsletterSnap.exists) return;
 
       const newsletter = withId<Newsletter>(newsletterSnap);
-      const patch = statsPatch({ ...EMPTY_STATS, ...(newsletter.stats ?? {}) }, { orders, revenue });
+      const stats = { ...EMPTY_STATS, ...(newsletter.stats ?? {}) };
+      const patch = statsPatch(stats, conversionDelta(stats, target, sign));
       // `update`: la patch usa i percorsi puntati, che `set` scriverebbe come
       // nomi di campo letterali.
       if (Object.keys(patch).length > 0) tx.update(newsletterRef, patch);
 
       if (recipientSnap?.exists) {
         const data = serializeDoc<Record<string, unknown>>(recipientSnap.data() ?? {});
+        const conversions = nextConversions(readRecipientConversions(data), order, target, sign);
         tx.set(
           recipientSnap.ref,
-          sign > 0
-            ? {
-                status: 'converted',
-                convertedOrderId: order.id,
-                convertedAt: order.placedAt,
-                revenue: attribution.attributedRevenue,
-                updatedAt: nowIso(),
-              }
-            : {
-                status: statusWithoutConversion(data),
-                convertedOrderId: null,
-                convertedAt: null,
-                revenue: null,
-                updatedAt: nowIso(),
-              },
+          {
+            ...conversionsPatch(conversions),
+            // Il destinatario resta "convertito" finché almeno un ordine è
+            // ancora attribuito a questo invio.
+            status: conversions.length > 0 ? 'converted' : statusWithoutConversion(data),
+            updatedAt: nowIso(),
+          },
           { merge: true },
         );
       }
@@ -339,10 +482,11 @@ async function applyConversion(
     return;
   }
 
-  if (attribution.automationId) {
-    const automationRef = col.automations().doc(attribution.automationId);
-    const runRef = attribution.automationRunId
-      ? col.automationRuns(attribution.automationId).doc(attribution.automationRunId)
+  if (target.automationId) {
+    const automationId = target.automationId;
+    const automationRef = col.automations().doc(automationId);
+    const runRef = target.automationRunId
+      ? col.automationRuns(automationId).doc(target.automationRunId)
       : null;
 
     await db.runTransaction(async (tx) => {
@@ -350,17 +494,24 @@ async function applyConversion(
       const runSnap = runRef ? await tx.get(runRef) : null;
       if (!automationSnap.exists) return;
 
+      const current = (automationSnap.get('stats') as { orders?: number; revenue?: number } | undefined) ?? {};
+      const delta = conversionDelta(
+        { orders: Number(current.orders ?? 0), revenue: Number(current.revenue ?? 0) },
+        target,
+        sign,
+      );
+
       const patch: Record<string, unknown> = {
-        'stats.orders': FieldValue.increment(orders),
-        'stats.revenue': FieldValue.increment(revenue),
         'stats.updatedAt': nowIso(),
         updatedAt: nowIso(),
       };
+      if (delta.orders !== 0) patch['stats.orders'] = FieldValue.increment(delta.orders);
+      if (delta.revenue !== 0) patch['stats.revenue'] = FieldValue.increment(delta.revenue);
 
       // Statistiche dello step: l'array va riscritto per intero.
       const steps = (automationSnap.get('steps') as Array<Record<string, unknown>> | undefined) ?? [];
       const stepId = (runSnap?.get('stepId') as string | undefined) ?? null;
-      if (stepId && steps.length > 0) {
+      if (stepId && steps.length > 0 && (delta.orders !== 0 || delta.revenue !== 0)) {
         patch.steps = steps.map((step) => {
           if (step.id !== stepId) return step;
           const stats = (step.stats as Record<string, number> | undefined) ?? {};
@@ -368,8 +519,9 @@ async function applyConversion(
             ...step,
             stats: {
               ...stats,
-              orders: Number(stats.orders ?? 0) + orders,
-              revenue: Math.round((Number(stats.revenue ?? 0) + revenue) * 100) / 100,
+              // Stesso principio dei contatori aggregati: mai sotto zero.
+              orders: Math.max(0, Math.round((Number(stats.orders ?? 0) + delta.orders) * 10_000) / 10_000),
+              revenue: Math.max(0, Math.round((Number(stats.revenue ?? 0) + delta.revenue) * 100) / 100),
             },
           };
         });
@@ -377,17 +529,9 @@ async function applyConversion(
       tx.update(automationRef, patch);
 
       if (runSnap?.exists) {
-        tx.set(
-          runSnap.ref,
-          sign > 0
-            ? {
-                convertedOrderId: order.id,
-                convertedAt: order.placedAt,
-                revenue: attribution.attributedRevenue,
-              }
-            : { convertedOrderId: null, convertedAt: null, revenue: null },
-          { merge: true },
-        );
+        const data = serializeDoc<Record<string, unknown>>(runSnap.data() ?? {});
+        const conversions = nextConversions(readRecipientConversions(data), order, target, sign);
+        tx.set(runSnap.ref, conversionsPatch(conversions), { merge: true });
       }
     });
   }
@@ -505,8 +649,15 @@ export async function attributeOrder(
     const usableOpens = opens.filter((touch) => hasTarget(touch) && isAvailable(touch, order.id));
 
     const selection = selectTouches(settings.model, usableClicks, usableOpens);
+    const shares = distributeAmount(revenue, selection.weights);
     attributions = selection.touches.map((touch, index) =>
-      attributionFromTouch(touch, order, settings.model, selection.weights[index] ?? 1, revenue),
+      attributionFromTouch(
+        touch,
+        order,
+        settings.model,
+        selection.weights[index] ?? 1,
+        shares[index] ?? 0,
+      ),
     );
     touchIds = selection.touches.map((touch) => touch.id);
   }
@@ -544,8 +695,10 @@ export async function attributeOrder(
   if (!claimed) return outcome(order.id, 'gia_attribuito');
 
   // 4. Effetti collaterali: contatori, destinatari, tocchi, coupon.
-  for (const attribution of attributions) {
-    await applyConversion(attribution, order, 1);
+  // Le attribuzioni si raggruppano per invio: più tocchi sulla stessa
+  // newsletter valgono un ordine solo, ripartito.
+  for (const target of groupByTarget(attributions)) {
+    await applyConversion(target, order, 1);
   }
   await markTouches(touchIds, order.id);
   if (coupon) await markCoupon(coupon, order, revenue);
@@ -605,8 +758,8 @@ export async function revokeAttribution(order: Order): Promise<AttributionOutcom
 
   if (!released) return outcome(order.id, 'gia_revocata');
 
-  for (const attribution of existing) {
-    await applyConversion(attribution, order, -1);
+  for (const target of groupByTarget(existing)) {
+    await applyConversion(target, order, -1);
   }
 
   await markTouches(
@@ -657,16 +810,21 @@ export async function adjustAttributedRevenue(order: Order): Promise<Attribution
   if (existing.length === 0) return outcome(order.id, 'nessuna_attribuzione');
 
   const revenue = attributableRevenue(order, settings);
-  const updated = existing.map((attribution) => ({
+  // Stessa ripartizione dell'attribuzione iniziale: le quote sommate restano
+  // esattamente il fatturato attribuibile dopo il reso.
+  const shares = distributeAmount(
+    revenue,
+    existing.map((attribution) => Number(attribution.weight ?? 0)),
+  );
+  const updated = existing.map((attribution, index) => ({
     ...attribution,
-    attributedRevenue: Math.round(revenue * attribution.weight * 100) / 100,
+    attributedRevenue: shares[index] ?? 0,
   }));
 
-  const deltas = updated.map(
-    (attribution, index) =>
-      Math.round((attribution.attributedRevenue - (existing[index]?.attributedRevenue ?? 0)) * 100) / 100,
+  const changed = updated.some(
+    (attribution, index) => attribution.attributedRevenue !== (existing[index]?.attributedRevenue ?? 0),
   );
-  if (deltas.every((delta) => delta === 0)) return outcome(order.id, 'nessuna_variazione');
+  if (!changed) return outcome(order.id, 'nessuna_variazione');
 
   const primary = [...updated].sort(
     (a, b) => Date.parse(b.touchAt ?? '') - Date.parse(a.touchAt ?? ''),
@@ -677,13 +835,13 @@ export async function adjustAttributedRevenue(order: Order): Promise<Attribution
     .doc(order.id)
     .set({ attribution: primary, attributions: updated, updatedAt: nowIso() }, { merge: true });
 
-  for (let index = 0; index < updated.length; index += 1) {
-    const delta = deltas[index] ?? 0;
+  // Il delta si calcola per invio di destinazione, non per tocco: altrimenti
+  // una newsletter con tre tocchi riceverebbe tre volte la stessa correzione.
+  const before = new Map(groupByTarget(existing).map((target) => [targetKey(target), target]));
+  for (const target of groupByTarget(updated)) {
+    const delta = Math.round((target.revenue - (before.get(targetKey(target))?.revenue ?? 0)) * 100) / 100;
     if (delta === 0) continue;
-    // Si riusa `applyConversion` con un'attribuzione "solo delta": gli ordini
-    // non cambiano (0), cambia solo il fatturato.
-    const attribution = updated[index]!;
-    await applyRevenueDelta(attribution, order, delta);
+    await applyRevenueDelta(target, order, delta);
   }
 
   const total = updated.reduce((sum, item) => sum + item.attributedRevenue, 0);
@@ -697,53 +855,93 @@ export async function adjustAttributedRevenue(order: Order): Promise<Attribution
   };
 }
 
+/** Aggiorna la quota di conversione di **questo** ordine, se presente. */
+function repricedConversions(
+  current: RecipientConversion[],
+  order: Order,
+  target: ConversionTarget,
+): RecipientConversion[] | null {
+  if (!current.some((conversion) => conversion.orderId === order.id)) return null;
+  return current.map((conversion) =>
+    conversion.orderId === order.id ? { ...conversion, revenue: target.revenue } : conversion,
+  );
+}
+
 /** Somma solo il fatturato (senza toccare il conteggio ordini). */
 async function applyRevenueDelta(
-  attribution: OrderAttribution,
+  target: ConversionTarget,
   order: Order,
   delta: number,
 ): Promise<void> {
-  if (attribution.newsletterId) {
-    const ref = col.newsletters().doc(attribution.newsletterId);
-    await db.runTransaction(async (tx) => {
-      const snapshot = await tx.get(ref);
-      if (!snapshot.exists) return;
-      const newsletter = withId<Newsletter>(snapshot);
-      const patch = statsPatch({ ...EMPTY_STATS, ...(newsletter.stats ?? {}) }, { revenue: delta });
-      if (Object.keys(patch).length > 0) tx.update(ref, patch);
-    });
-
+  if (target.newsletterId) {
+    const ref = col.newsletters().doc(target.newsletterId);
     const recipientRef = await findRecipientInNewsletter(
-      attribution.newsletterId,
+      target.newsletterId,
       order.contactId ?? null,
       normalizeEmail(order.emailNormalized || order.email),
     );
-    if (recipientRef) {
-      await recipientRef.set(
-        { revenue: attribution.attributedRevenue, updatedAt: nowIso() },
-        { merge: true },
-      );
-    }
+
+    await db.runTransaction(async (tx) => {
+      const snapshot = await tx.get(ref);
+      const recipientSnap = recipientRef ? await tx.get(recipientRef) : null;
+      if (!snapshot.exists) return;
+
+      const newsletter = withId<Newsletter>(snapshot);
+      const stats = { ...EMPTY_STATS, ...(newsletter.stats ?? {}) };
+      // Un reso non può portare il fatturato della newsletter sotto zero.
+      const applied = Math.max(delta, -Number(stats.revenue ?? 0));
+      const patch = statsPatch(stats, { revenue: applied });
+      if (Object.keys(patch).length > 0) tx.update(ref, patch);
+
+      if (recipientSnap?.exists) {
+        const data = serializeDoc<Record<string, unknown>>(recipientSnap.data() ?? {});
+        const conversions = repricedConversions(readRecipientConversions(data), order, target);
+        if (conversions) {
+          tx.set(
+            recipientSnap.ref,
+            { ...conversionsPatch(conversions), updatedAt: nowIso() },
+            { merge: true },
+          );
+        }
+      }
+    });
     return;
   }
 
-  if (attribution.automationId) {
+  if (target.automationId) {
+    const automationId = target.automationId;
+    const automationRef = col.automations().doc(automationId);
+    const runRef = target.automationRunId
+      ? col.automationRuns(automationId).doc(target.automationRunId)
+      : null;
+
     try {
-      // `update` e non `set`: i percorsi puntati devono restare annidati.
-      await col
-        .automations()
-        .doc(attribution.automationId)
-        .update({ 'stats.revenue': FieldValue.increment(delta), 'stats.updatedAt': nowIso(), updatedAt: nowIso() });
+      await db.runTransaction(async (tx) => {
+        const automationSnap = await tx.get(automationRef);
+        const runSnap = runRef ? await tx.get(runRef) : null;
+        if (!automationSnap.exists) return;
+
+        const stats = (automationSnap.get('stats') as { revenue?: number } | undefined) ?? {};
+        const applied = Math.max(delta, -Number(stats.revenue ?? 0));
+        if (applied !== 0) {
+          // `update` e non `set`: i percorsi puntati devono restare annidati.
+          tx.update(automationRef, {
+            'stats.revenue': FieldValue.increment(applied),
+            'stats.updatedAt': nowIso(),
+            updatedAt: nowIso(),
+          });
+        }
+
+        if (runSnap?.exists) {
+          const data = serializeDoc<Record<string, unknown>>(runSnap.data() ?? {});
+          const conversions = repricedConversions(readRecipientConversions(data), order, target);
+          if (conversions) tx.set(runSnap.ref, conversionsPatch(conversions), { merge: true });
+        }
+      });
     } catch (error) {
       log.error('Aggiornamento fatturato automazione fallito', error, {
-        automationId: attribution.automationId,
+        automationId,
       });
-    }
-    if (attribution.automationRunId) {
-      await col
-        .automationRuns(attribution.automationId)
-        .doc(attribution.automationRunId)
-        .set({ revenue: attribution.attributedRevenue }, { merge: true });
     }
   }
 }

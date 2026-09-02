@@ -43,6 +43,18 @@ service cloud.firestore {
                  'contactCount', 'sendableCount', 'lastComputedAt']);
     }
 
+    // Stessa protezione in creazione. Serve una funzione a parte: su una create
+    // `resource` è null e `diff()` fallirebbe, quindi si guardano direttamente
+    // le chiavi del documento in arrivo. Senza questa regola un editor potrebbe
+    // creare da zero una newsletter "inviata" con statistiche e fatturato
+    // inventati, che la dashboard leggerebbe come dati veri.
+    function noManagedFieldsOnCreate() {
+      return !request.resource.data.keys()
+        .hasAny(['stats', 'engagement', 'brevoCampaignId', 'brevoContactId', 'brevoListIds',
+                 'contactCount', 'sendableCount', 'lastComputedAt',
+                 'sentAt', 'startedSendingAt', 'completedAt', 'sendAttempts']);
+    }
+
     // -------------------------------------------------------------------------
     // Utenti
     // -------------------------------------------------------------------------
@@ -69,7 +81,8 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     match /clusters/{clusterId} {
       allow read: if canRead();
-      allow create: if atLeast('editor');
+      // Il conteggio dei contatti lo scrive il ricalcolo, non chi crea il cluster.
+      allow create: if atLeast('editor') && noManagedFieldsOnCreate();
       allow update: if atLeast('editor') && noStatsTampering();
       allow delete: if atLeast('admin');
     }
@@ -79,7 +92,11 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     match /newsletters/{newsletterId} {
       allow read: if canRead();
-      allow create: if atLeast('editor');
+      // Una newsletter nasce bozza (o pianificata) e senza statistiche: stato di
+      // invio, identificativi Brevo e numeri li scrivono le Functions.
+      allow create: if atLeast('editor')
+                    && noManagedFieldsOnCreate()
+                    && (request.resource.data.get('status', 'draft') in ['draft', 'scheduled']);
       allow update: if atLeast('editor')
                     && noStatsTampering()
                     // Lo stato di invio è governato dalle Functions.

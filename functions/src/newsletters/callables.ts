@@ -77,6 +77,7 @@ import {
   cancelNewsletterQueue,
   dispatchNewsletter,
   finalizeNewsletterIfComplete,
+  hasPreparedQueue,
   pauseNewsletterQueue,
   resumeNewsletterQueue,
 } from './sender';
@@ -187,6 +188,17 @@ export const updateNewsletter = onCall(
 
       const existing = await requireNewsletter(input.newsletterId);
       assertEditable(existing);
+      // `paused` è uno stato modificabile, ma non quando la spedizione è già
+      // stata preparata: i batch rimasti partirebbero con il contenuto nuovo,
+      // mentre chi è già stato servito ha in casella quello vecchio. Il
+      // congelamento è anche nel trigger (`isContentFrozen`), qui si nega la
+      // modifica per dirlo all'operatore invece di ignorarla in silenzio.
+      if (existing.status === 'paused' && hasPreparedQueue(existing)) {
+        throw failedPrecondition(
+          'La spedizione è già iniziata ed è solo sospesa: il contenuto non può più essere modificato. ' +
+            'Annulla la programmazione oppure duplica la newsletter per inviarne una versione diversa.',
+        );
+      }
 
       const patch = buildNewsletterPatch(existing, input, caller.uid);
       const newsletter = await updateNewsletterRecord(input.newsletterId, patch, caller.uid);

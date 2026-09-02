@@ -303,7 +303,12 @@ function utmFor(automation: Automation, step: AutomationStep, env: DispatchEnvir
 
 /**
  * Elabora una singola run: valuta, costruisce, invia e aggiorna.
- * Non solleva: qualunque errore diventa `failed` e viene riportato al chiamante.
+ *
+ * Non solleva mai, dalla prima riga all'ultima: un errore diventa `failed`
+ * (`claim_perso` se la run non è stata nemmeno presa in carico) e viene
+ * riportato al chiamante. Una run malata non deve abbattere la corsa: le altre
+ * run resterebbero indietro e le statistiche di quelle già spedite, che si
+ * scrivono in fondo a `runAutomationDispatch`, andrebbero perse.
  */
 async function processRun(
   run: AutomationRun,
@@ -313,73 +318,87 @@ async function processRun(
 ): Promise<RunResult> {
   const base: RunResult = { outcome: 'failed', automationId: automation.id, stepId: run.stepId };
 
-  const claimed = await claimRun(automation.id, run.id);
-  if (!claimed) return { ...base, outcome: 'claim_perso' };
-
-  const step = findStep(automation, run.stepId);
-  if (!step) {
-    await updateRun(automation.id, run.id, {
-      status: 'skipped',
-      skipReason: 'Lo step non esiste più nell\'automazione.',
-      processedAt: nowIso(),
+  // Il claim sta fuori dal try che segue: se la transazione fallisce (contesa,
+  // Firestore momentaneamente indisponibile) la run non è stata presa in carico
+  // e nulla è stato scritto. Marcarla `failed` la brucerebbe: resta
+  // `scheduled` e la riprende la corsa successiva.
+  let claimedRun: AutomationRun | null = null;
+  try {
+    claimedRun = await claimRun(automation.id, run.id);
+  } catch (error) {
+    log.error('Presa in carico della run non riuscita', error, {
+      automationId: automation.id,
+      runId: run.id,
     });
-    return { ...base, outcome: 'skipped' };
+    return { ...base, outcome: 'claim_perso' };
   }
-
-  const contact = contactsById.get(run.contactId) ?? null;
-  if (!contact) {
-    await updateRun(automation.id, run.id, {
-      status: 'skipped',
-      skipReason: 'Contatto non più presente in rubrica.',
-      processedAt: nowIso(),
-    });
-    return { ...base, outcome: 'skipped' };
-  }
-
-  // 1. Condizioni di annullamento.
-  const cancelled = await evaluateCancelConditions(claimed, automation, step, contact);
-  if (cancelled) {
-    await updateRun(automation.id, run.id, {
-      status: 'cancelled',
-      cancelledReason: cancelled,
-      processedAt: nowIso(),
-    });
-    return { ...base, outcome: 'cancelled' };
-  }
-  if (!isContactSendable(contact)) {
-    await updateRun(automation.id, run.id, {
-      status: 'cancelled',
-      cancelledReason: 'not_sendable',
-      processedAt: nowIso(),
-    });
-    return { ...base, outcome: 'cancelled' };
-  }
-
-  // 2. Contenuto.
-  const document = await resolveStepDocument(step);
-  if (!document) {
-    await updateRun(automation.id, run.id, {
-      status: 'skipped',
-      skipReason: 'Lo step non ha un documento email né un template collegato.',
-      processedAt: nowIso(),
-    });
-    return { ...base, outcome: 'skipped' };
-  }
-
-  // 3. Destinatari (modalità test compresa).
-  const recipients = automation.testMode
-    ? (automation.testRecipients ?? []).map((email) => normalizeEmail(email)).filter(Boolean)
-    : [normalizeEmail(contact.emailNormalized || contact.email)];
-  if (!recipients.length) {
-    await updateRun(automation.id, run.id, {
-      status: 'skipped',
-      skipReason: 'Modalità test attiva ma nessun indirizzo di prova configurato.',
-      processedAt: nowIso(),
-    });
-    return { ...base, outcome: 'skipped' };
-  }
+  if (!claimedRun) return { ...base, outcome: 'claim_perso' };
+  const claimed = claimedRun;
 
   try {
+    const step = findStep(automation, run.stepId);
+    if (!step) {
+      await updateRun(automation.id, run.id, {
+        status: 'skipped',
+        skipReason: 'Lo step non esiste più nell\'automazione.',
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'skipped' };
+    }
+
+    const contact = contactsById.get(run.contactId) ?? null;
+    if (!contact) {
+      await updateRun(automation.id, run.id, {
+        status: 'skipped',
+        skipReason: 'Contatto non più presente in rubrica.',
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'skipped' };
+    }
+
+    // 1. Condizioni di annullamento.
+    const cancelled = await evaluateCancelConditions(claimed, automation, step, contact);
+    if (cancelled) {
+      await updateRun(automation.id, run.id, {
+        status: 'cancelled',
+        cancelledReason: cancelled,
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'cancelled' };
+    }
+    if (!isContactSendable(contact)) {
+      await updateRun(automation.id, run.id, {
+        status: 'cancelled',
+        cancelledReason: 'not_sendable',
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'cancelled' };
+    }
+
+    // 2. Contenuto.
+    const document = await resolveStepDocument(step);
+    if (!document) {
+      await updateRun(automation.id, run.id, {
+        status: 'skipped',
+        skipReason: 'Lo step non ha un documento email né un template collegato.',
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'skipped' };
+    }
+
+    // 3. Destinatari (modalità test compresa).
+    const recipients = automation.testMode
+      ? (automation.testRecipients ?? []).map((email) => normalizeEmail(email)).filter(Boolean)
+      : [normalizeEmail(contact.emailNormalized || contact.email)];
+    if (!recipients.length) {
+      await updateRun(automation.id, run.id, {
+        status: 'skipped',
+        skipReason: 'Modalità test attiva ma nessun indirizzo di prova configurato.',
+        processedAt: nowIso(),
+      });
+      return { ...base, outcome: 'skipped' };
+    }
+
     // 4. Coupon: prima dell'invio, perché il codice finisce nel corpo dell'email.
     let couponCode: string | null = null;
     let couponExpiresAt: IsoDate | null = null;
@@ -534,16 +553,27 @@ async function processRun(
     return { ...base, outcome: 'sent' };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Errore sconosciuto';
-    log.error('Invio automazione non riuscito', error, {
+    log.error('Elaborazione della run non riuscita', error, {
       automationId: automation.id,
       runId: run.id,
       stepId: run.stepId,
     });
-    await updateRun(automation.id, run.id, {
-      status: 'failed',
-      error: message,
-      processedAt: nowIso(),
-    });
+    try {
+      await updateRun(automation.id, run.id, {
+        status: 'failed',
+        error: message,
+        processedAt: nowIso(),
+      });
+    } catch (updateError) {
+      // Nemmeno la registrazione dell'errore è andata a buon fine: si riporta
+      // comunque l'esito al chiamante, altrimenti l'eccezione risalirebbe a
+      // `runAutomationDispatch` e farebbe cadere l'intera corsa — comprese le
+      // statistiche delle run già spedite.
+      log.error('Registrazione dell\'errore sulla run non riuscita', updateError, {
+        automationId: automation.id,
+        runId: run.id,
+      });
+    }
     return { ...base, outcome: 'failed', error: message };
   }
 }

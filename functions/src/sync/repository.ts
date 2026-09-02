@@ -53,7 +53,7 @@ import type {
   StoreSource,
 } from '@alphaink/shared';
 import { chunk, mapWithConcurrency } from '../lib/async';
-import { commitInBatches, col, db, nowIso } from '../lib/firestore';
+import { commitInBatches, col, db, nowIso, paginateQuery } from '../lib/firestore';
 import { createLogger } from '../lib/logger';
 import { EMPTY_CONTACT_STATS, buildContactPatch, readStateTimestamps, round2, segmentForGroups } from './normalize';
 
@@ -62,8 +62,18 @@ const log = createLogger('sync.repository');
 /** Documenti letti in un colpo solo con `getAll`. */
 const READ_CHUNK = 250;
 
-/** Ordini caricati per ricalcolare le statistiche di un contatto. */
+/** Ordini **incassati** considerati nel ricalcolo statistiche di un contatto. */
 const MAX_ORDERS_PER_CONTACT = 1000;
+
+/**
+ * Documenti letti al massimo per contatto, di qualunque stato.
+ * Serve solo a limitare la scansione di un cliente con uno storico enorme:
+ * il tetto che conta è quello sugli ordini incassati.
+ */
+const MAX_ORDERS_SCAN_PER_CONTACT = 10_000;
+
+/** Ordini letti per pagina durante il ricalcolo. */
+const ORDERS_PAGE_SIZE = 500;
 
 /** Stampanti conservate per contatto: oltre, il documento cresce inutilmente. */
 const MAX_PRINTERS = 20;
@@ -266,8 +276,53 @@ function minimalContact(
 // Ordini
 // -----------------------------------------------------------------------------
 
-/** Documento `orders` a partire dall'ordine normalizzato. */
-function orderDocument(
+/** Importi che un payload parziale può non portare. */
+type PreservableAmount = 'subtotal' | 'shipping' | 'tax';
+
+/** Campi testuali o temporali che un payload parziale può non portare. */
+type PreservableText = 'orderNumber' | 'paidAt' | 'completedAt' | 'cancelledAt' | 'refundedAt';
+
+/**
+ * Scrive l'importo solo se il payload lo contiene davvero.
+ * `null`/`undefined` in arrivo significa "campo assente", non "importo
+ * azzerato": l'azzeramento esplicito ha senso solo alla creazione.
+ */
+function setAmount(
+  document: Partial<Order>,
+  existing: Order | null,
+  field: PreservableAmount,
+  value: number | null | undefined,
+): void {
+  if (typeof value === 'number' && Number.isFinite(value)) document[field] = value;
+  else if (!existing) document[field] = null;
+}
+
+/** Come `setAmount`, per i campi testuali e le date di stato. */
+function setText(
+  document: Partial<Order>,
+  existing: Order | null,
+  field: PreservableText,
+  value: string | null | undefined,
+): void {
+  if (value) document[field] = value;
+  else if (!existing) document[field] = null;
+}
+
+/**
+ * Documento `orders` a partire dall'ordine normalizzato.
+ *
+ * Il payload può essere **parziale**: il webhook del sito ammette la notifica
+ * del solo cambio di stato (`{ id, email, stateId }`) e la normalizzazione
+ * riempie ciò che manca con i default (`items: []`, `total: 0`, date a `null`).
+ * Con `merge: true` scrivere quei default cancellerebbe righe, importi e date
+ * già sincronizzati da MySQL, e il `recomputeContactStats` che segue
+ * propagherebbe la perdita sulle statistiche del contatto. Perciò i campi che
+ * un aggiornamento parziale non porta si scrivono solo quando hanno davvero un
+ * valore, oppure alla creazione del documento — la regola già usata per
+ * `couponCode`. Stato e date di sincronizzazione, che sono invece il contenuto
+ * di quei webhook, si scrivono sempre.
+ */
+export function orderDocument(
   order: NormalizedOrder,
   contactId: DocId,
   existing: Order | null,
@@ -278,32 +333,46 @@ function orderDocument(
     new Set(order.items.map((item) => item.family ?? 'altro').filter(Boolean)),
   ) as string[];
   const skus = Array.from(new Set(order.items.map((item) => item.sku).filter(Boolean)));
+  const total = round2(order.total);
+  /** Il payload porta il contenuto commerciale dell'ordine (righe o importo). */
+  const carriesAmounts = order.items.length > 0 || total > 0;
 
   const document: Partial<Order> = {
     externalId: order.externalId,
     source: order.source,
-    orderNumber: order.orderNumber ?? null,
     email: order.email,
     emailNormalized: normalizeEmail(order.email),
     contactId,
     status: order.normalizedStatus,
     rawStatus: order.status,
-    total: round2(order.total),
-    subtotal: order.subtotal ?? null,
-    shipping: order.shipping ?? null,
-    tax: order.tax ?? null,
     currency: order.currency || DEFAULT_CURRENCY,
-    items: order.items,
-    families,
-    skus,
-    placedAt: order.placedAt,
-    paidAt: timestamps.paidAt,
-    completedAt: timestamps.completedAt,
-    cancelledAt: timestamps.cancelledAt,
-    refundedAt: timestamps.refundedAt,
     lastSyncAt: now,
     updatedAt: now,
   };
+
+  // Righe, famiglie e sku viaggiano insieme: un array vuoto su un ordine già
+  // sincronizzato è un payload che non le porta, non un ordine svuotato.
+  if (order.items.length > 0 || !existing) {
+    document.items = order.items;
+    document.families = families;
+    document.skus = skus;
+  }
+  if (carriesAmounts || !existing) document.total = total;
+  // La data dell'ordine si aggiorna solo con un payload completo: quando il
+  // sito non la manda, la normalizzazione ci mette "adesso" e sposterebbe
+  // l'ordine (e con lui `firstOrderAt`/`lastOrderAt`) al giorno del webhook.
+  if (carriesAmounts || !existing) document.placedAt = order.placedAt;
+
+  setAmount(document, existing, 'subtotal', order.subtotal);
+  setAmount(document, existing, 'shipping', order.shipping);
+  setAmount(document, existing, 'tax', order.tax);
+  setText(document, existing, 'orderNumber', order.orderNumber);
+  // Le date di stato sono fatti accaduti: un webhook che ne annuncia uno solo
+  // ricostruisce uno storico con gli altri a `null` e non deve cancellarli.
+  setText(document, existing, 'paidAt', timestamps.paidAt);
+  setText(document, existing, 'completedAt', timestamps.completedAt);
+  setText(document, existing, 'cancelledAt', timestamps.cancelledAt);
+  setText(document, existing, 'refundedAt', timestamps.refundedAt);
 
   // Campi che possono arrivare da altre sorgenti (webhook del sito, tracking):
   // si scrivono solo se abbiamo un valore, per non cancellare quello esistente.
@@ -649,8 +718,16 @@ const DAY_MS = 86_400_000;
 export interface RecomputeOptions {
   /** Cicli di riacquisto per famiglia, da `settings/site`. */
   repurchaseCycleDays?: Record<string, number>;
-  /** Numero massimo di ordini considerati. */
+  /** Numero massimo di ordini **incassati** considerati. */
   ordersLimit?: number;
+}
+
+/** Interruzione controllata della scansione degli ordini di un contatto. */
+class OrderScanStopped extends Error {
+  constructor() {
+    super('order-scan-stopped');
+    this.name = 'OrderScanStopped';
+  }
 }
 
 /**
@@ -675,18 +752,52 @@ export async function recomputeContactStats(
   const emailNormalized = contact.emailNormalized ?? normalizeEmail(contact.email ?? '');
   if (!emailNormalized) return null;
 
-  // Query servita dall'indice (emailNormalized ASC, placedAt DESC).
-  const ordersSnapshot = await col
-    .orders()
-    .where('emailNormalized', '==', emailNormalized)
-    .orderBy('placedAt', 'desc')
-    .limit(options.ordersLimit ?? MAX_ORDERS_PER_CONTACT)
-    .get();
+  // Query servita dall'indice (emailNormalized ASC, placedAt DESC), scorsa a
+  // pagine leggendo i soli campi che servono al calcolo: il tetto deve valere
+  // sugli ordini INCASSATI, altrimenti annullati e mai pagati occupano i posti
+  // della finestra e spingono fuori acquisti veri (`ordersCount`, `totalSpent`
+  // e `firstOrderAt` risulterebbero troncati senza che nessuno se ne accorga).
+  const revenueLimit = Math.max(1, options.ordersLimit ?? MAX_ORDERS_PER_CONTACT);
+  const orders: Order[] = [];
+  let scanned = 0;
+  let truncated = false;
 
-  const orders = ordersSnapshot.docs
-    .map((doc) => doc.data() as Order)
-    .filter((order) => REVENUE_ORDER_STATUSES.includes(order.status))
-    .sort((a, b) => Date.parse(a.placedAt) - Date.parse(b.placedAt));
+  try {
+    await paginateQuery(
+      col
+        .orders()
+        .where('emailNormalized', '==', emailNormalized)
+        .orderBy('placedAt', 'desc')
+        .select('status', 'total', 'placedAt', 'items'),
+      ORDERS_PAGE_SIZE,
+      async (docs) => {
+        for (const doc of docs) {
+          scanned += 1;
+          const order = doc.data() as Order;
+          if (!REVENUE_ORDER_STATUSES.includes(order.status)) continue;
+          orders.push(order);
+          if (orders.length >= revenueLimit) throw new OrderScanStopped();
+        }
+        if (scanned >= MAX_ORDERS_SCAN_PER_CONTACT) throw new OrderScanStopped();
+      },
+    );
+  } catch (error) {
+    if (!(error instanceof OrderScanStopped)) throw error;
+    truncated = true;
+  }
+
+  if (truncated) {
+    // Le statistiche restano quelle degli ordini più recenti: va detto, perché
+    // `firstOrderAt` e `totalSpent` non coprono più tutta la storia.
+    log.warn('Statistiche calcolate su uno storico troncato', {
+      contactId,
+      scanned,
+      revenueOrders: orders.length,
+      revenueLimit,
+    });
+  }
+
+  orders.sort((a, b) => Date.parse(a.placedAt) - Date.parse(b.placedAt));
 
   const stats = computeStats(orders, options.repurchaseCycleDays);
   const printers = mergePrinters(contact.printers ?? [], derivePrinters(orders));

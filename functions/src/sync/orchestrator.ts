@@ -24,6 +24,12 @@
  *   andrebbe altrimenti perso. Le scritture sono idempotenti, quindi rileggere
  *   qualche record non fa danni.
  *
+ * - **Avanzamento della finestra.** `lastSyncAt` avanza solo quando la finestra
+ *   è stata davvero coperta (job `success`) e solo fino all'avvio della PRIMA
+ *   corsa della catena: un'entità fallita o una ripresa ancora in sospeso
+ *   lasciano scoperto un pezzo di finestra che, se `lastSyncAt` avanzasse,
+ *   nessuna corsa successiva rileggerebbe più.
+ *
  * - **Annullamento.** `cancelSiteSync` marca il job con `cancelRequested`;
  *   l'orchestratore lo rilegge ad ogni pagina e si ferma in modo pulito.
  */
@@ -172,6 +178,8 @@ export function buildJobId(source: StoreSource, startedAt: IsoDate): string {
 interface ResumableJob {
   jobId: string;
   since: IsoDate | null;
+  /** Avvio della PRIMA corsa della catena: fine della finestra in lavorazione. */
+  windowStartedAt: IsoDate | null;
   cursors: Record<string, string | null>;
   completed: SyncEntity[];
 }
@@ -191,7 +199,11 @@ async function findResumableJob(source: StoreSource): Promise<ResumableJob | nul
     .get();
 
   for (const doc of snapshot.docs) {
-    const data = doc.data() as SyncJob & { resumeRequired?: boolean; completedEntities?: SyncEntity[] };
+    const data = doc.data() as SyncJob & {
+      resumeRequired?: boolean;
+      completedEntities?: SyncEntity[];
+      windowStartedAt?: IsoDate | null;
+    };
     // Un job ancora in corso appartiene a un'altra esecuzione: non si tocca.
     if (data.status === 'running' || data.status === 'queued') continue;
     if (data.status !== 'partial' || !data.resumeRequired || !data.cursor) return null;
@@ -205,6 +217,9 @@ async function findResumableJob(source: StoreSource): Promise<ResumableJob | nul
     return {
       jobId: doc.id,
       since: data.since ?? null,
+      // I job scritti prima di questo campo non lo hanno: l'avvio del job
+      // ripreso è comunque anteriore a quello della corsa corrente.
+      windowStartedAt: data.windowStartedAt ?? data.startedAt ?? null,
       cursors,
       completed: data.completedEntities ?? [],
     };
@@ -262,6 +277,15 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
   /** Entità portate a termine: alla ripresa non vengono rifatte. */
   const completed: SyncEntity[] = [];
 
+  /**
+   * Istante fino al quale la finestra incrementale sarà coperta quando la
+   * catena di riprese si chiuderà. È l'avvio della PRIMA corsa: nelle riprese
+   * la scansione riparte dal cursore keyset e non rivede i record già superati,
+   * quindi avanzare `lastSyncAt` all'avvio della corsa corrente perderebbe per
+   * sempre i record modificati durante la catena e rimasti sotto al cursore.
+   */
+  let windowStartedAt: IsoDate = startedAt;
+
   // Ripresa di un job interrotto per budget di tempo: si ereditano finestra
   // temporale e cursori, altrimenti il cursore punterebbe a una selezione
   // diversa da quella su cui era stato calcolato.
@@ -273,6 +297,7 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
     if (previous) {
       Object.assign(cursors, previous.cursors);
       since = previous.since;
+      windowStartedAt = previous.windowStartedAt ?? startedAt;
       pending = entities.filter((entity) => !previous.completed.includes(entity));
       for (const entity of previous.completed) if (entities.includes(entity)) completed.push(entity);
       warnings.push(
@@ -285,7 +310,12 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
   if (pending.length === 0) pending = entities;
 
   const jobRef = col.syncJobs().doc(buildJobId(input.source, startedAt));
-  const job: SyncJob & { cancelRequested: boolean; completedEntities: SyncEntity[]; resumeRequired: boolean } = {
+  const job: SyncJob & {
+    cancelRequested: boolean;
+    completedEntities: SyncEntity[];
+    resumeRequired: boolean;
+    windowStartedAt: IsoDate;
+  } = {
     id: jobRef.id,
     source: input.source,
     entities,
@@ -303,6 +333,7 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
     cancelRequested: false,
     completedEntities: [...completed],
     resumeRequired: false,
+    windowStartedAt,
   };
   await jobRef.set(job);
 
@@ -450,6 +481,19 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
   const status = finalStatus({ cancelled, fatalError, counts, entities, resumeRequired });
   const finishedAt = nowIso();
   const durationMs = Date.now() - startedMs;
+  const failedEntities = entities.filter((entity) => (counts[entity]?.failed ?? 0) > 0);
+
+  // La finestra incrementale è coperta solo se ogni entità richiesta è arrivata
+  // in fondo: un'entità fallita o una ripresa ancora da fare lasciano scoperto
+  // un pezzo di `[since, windowStartedAt]`.
+  const windowClosed = status === 'success';
+  if (!windowClosed && !cancelled) {
+    warnings.push(
+      since
+        ? `Finestra incrementale non chiusa: la prossima corsa ripartirà da ${since}.`
+        : 'Finestra incrementale non chiusa: la prossima corsa rileggerà tutto lo storico.',
+    );
+  }
 
   await jobRef.set(
     {
@@ -466,13 +510,25 @@ export async function runSync(input: RunSyncInput): Promise<RunSyncResult> {
     { merge: true },
   );
 
-  // `lastSyncAt` = inizio del job, non fine: i record modificati DURANTE il job
-  // devono rientrare nella finestra della corsa successiva.
-  if (status === 'success' || status === 'partial') {
-    await markStoreSync(input.source, { at: startedAt, error: fatalError });
+  // `lastSyncAt` avanza solo fino al punto realmente coperto: l'avvio della
+  // PRIMA corsa della catena, non la fine del job (i record modificati durante
+  // il job devono rientrare nella finestra successiva) né l'avvio della corsa
+  // corrente (nelle riprese la scansione riparte dal cursore e i record già
+  // superati non vengono rivisti).
+  if (windowClosed) {
+    await markStoreSync(input.source, { at: windowStartedAt, error: null });
   } else if (status === 'failed') {
     // Solo l'errore: `lastSyncAt` resta al valore precedente.
     await markStoreSync(input.source, { error: fatalError ?? 'Sincronizzazione fallita.' });
+  } else if (status === 'partial') {
+    // Idem per il parziale: la finestra non coperta va riletta. Si segnala come
+    // errore solo un'entità fallita; la ripresa per budget di tempo è normale.
+    await markStoreSync(input.source, {
+      error:
+        failedEntities.length > 0
+          ? `Entità non sincronizzate: ${failedEntities.join(', ')}. La finestra verrà riletta alla prossima corsa.`
+          : null,
+    });
   }
 
   const totals = Object.values(counts).reduce(

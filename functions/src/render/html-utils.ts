@@ -293,23 +293,225 @@ const DANGEROUS_TAGS =
   'script|style|iframe|object|embed|noscript|svg|math|template|form|textarea|select|applet|frame|frameset';
 
 /**
- * Rimuove gli elementi pericolosi, i gestori `on*` e gli URL con schema
- * eseguibile mantenendo il resto del markup. Usato dal blocco "HTML
- * personalizzato", dove l'utente deve poter scrivere tabelle e tag arbitrari.
+ * Tag ammessi nel blocco "HTML personalizzato": tutto ciò che serve a comporre
+ * una email a tabelle. È una whitelist, non un elenco di forme vietate: un tag
+ * scritto in modo creativo (`<img/onerror=…>`, maiuscole miste, attributi senza
+ * virgolette) non passa perché non somiglia a un attacco noto, passa solo se è
+ * esplicitamente in elenco.
+ */
+const ALLOWED_BLOCK_TAGS = new Set([
+  ...ALLOWED_INLINE_TAGS,
+  'div', 'section', 'article', 'header', 'footer', 'main', 'aside',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption', 'col', 'colgroup',
+  'img', 'hr', 'h5', 'h6', 'blockquote', 'pre', 'code', 'small', 'sub', 'sup',
+  'strike', 'center', 'font', 'abbr', 'big', 'tt', 'dl', 'dt', 'dd',
+  'figure', 'figcaption',
+]);
+
+/** Attributi ammessi nel blocco "HTML personalizzato". */
+const ALLOWED_BLOCK_ATTRS = new Set([
+  'href', 'target', 'rel', 'name', 'title', 'alt', 'src', 'background',
+  'width', 'height', 'border', 'align', 'valign', 'bgcolor', 'nowrap', 'summary',
+  'cellpadding', 'cellspacing', 'colspan', 'rowspan', 'span', 'start', 'type',
+  'class', 'id', 'dir', 'lang', 'role', 'style', 'color', 'face', 'size',
+]);
+
+/**
+ * Nodi riconosciuti dallo scanner: commento, dichiarazione (`<!doctype …>`) e
+ * tag. Il "resto" del tag ammette solo stringhe quotate o caratteri diversi da
+ * `>`, così un `>` dentro un valore fra virgolette non chiude il tag in
+ * anticipo: è il punto in cui le sanificazioni a sole regex si fanno aggirare.
+ */
+const HTML_NODE_RE =
+  /<!--[\s\S]*?-->|<![\s\S]*?>|<(\/?)([a-zA-Z][a-zA-Z0-9:-]*)((?:"[^"]*"|'[^']*'|[^"'>])*)>/g;
+
+/**
+ * Sanifica il markup del blocco "HTML personalizzato".
+ *
+ * Riscrive il documento tag per tag tenendo solo quelli in whitelist e, per
+ * ciascuno, solo gli attributi ammessi con un valore validato: `href` e `src`
+ * passano da `safeUrl`/`safeImageUrl` (che normalizzano entità, maiuscole e
+ * caratteri di controllo prima di guardare lo schema), `style` da
+ * `sanitizeBlockStyleValue`. Ogni altro attributo — quindi qualunque `on*`,
+ * comunque separato dal nome del tag — semplicemente non è in elenco.
+ *
+ * I commenti restano come sono: i condizionali Outlook (`<!--[if mso]>…`) fanno
+ * parte del markup che l'operatore incolla e il loro contenuto è inerte nei
+ * browser che non li interpretano.
  */
 export function stripUnsafeHtml(html: string): string {
   if (!html) return '';
-  return String(html)
+  // Gli elementi pericolosi vanno via con tutto il contenuto: togliere solo il
+  // tag lascerebbe il corpo dello script come testo visibile.
+  const source = String(html)
     .replace(new RegExp(`<(${DANGEROUS_TAGS})\\b[^>]*>[\\s\\S]*?<\\/\\s*\\1\\s*>`, 'gi'), '')
     .replace(new RegExp(`<\\/?(?:${DANGEROUS_TAGS})\\b[^>]*>`, 'gi'), '')
-    .replace(/<\?[\s\S]*?\?>/g, '')
-    // Attributi evento: `onclick="..."`, `onerror='...'`, `onload=x`.
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(
-      /\s(?:href|src|background|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|file|blob)\s*:[^"]*"|'\s*(?:javascript|vbscript|file|blob)\s*:[^']*'|(?:javascript|vbscript|file|blob):[^\s>]*)/gi,
-      '',
-    )
-    .replace(/\sstyle\s*=\s*(?:"[^"]*expression\s*\([^"]*"|'[^']*expression\s*\([^']*')/gi, '');
+    .replace(/<\?[\s\S]*?\?>/g, '');
+
+  let out = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  HTML_NODE_RE.lastIndex = 0;
+
+  while ((match = HTML_NODE_RE.exec(source)) !== null) {
+    // Un `<` isolato nel testo viene escapato: non deve poter iniziare un tag.
+    out += source.slice(cursor, match.index).replace(/</g, '&lt;');
+    cursor = HTML_NODE_RE.lastIndex;
+
+    const node = match[0];
+    if (node.startsWith('<!--')) {
+      out += node;
+      continue;
+    }
+    if (node.startsWith('<!')) {
+      if (/^<!doctype\b/i.test(node)) out += node;
+      continue;
+    }
+
+    const name = match[2].toLowerCase();
+    if (!ALLOWED_BLOCK_TAGS.has(name)) continue;
+    if (match[1] === '/') {
+      out += `</${name}>`;
+      continue;
+    }
+
+    const filtered = filterBlockAttributes(match[3] ?? '');
+    // Se nulla è stato tolto o riscritto si riemette il tag originale: evita di
+    // riformattare markup già sano (e di segnalare pulizie mai avvenute).
+    out += filtered.changed ? `<${name}${filtered.serialized}>` : node;
+  }
+
+  out += source.slice(cursor).replace(/</g, '&lt;');
+  return out;
+}
+
+/**
+ * Filtra gli attributi di un tag del blocco HTML. `changed` è false solo quando
+ * ogni attributo è ammesso ed è sopravvissuto identico: in quel caso il
+ * chiamante può riusare il testo originale del tag.
+ */
+function filterBlockAttributes(raw: string): { serialized: string; changed: boolean } {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  let changed = false;
+  let cursor = 0;
+  let unmatched = '';
+
+  ATTR_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ATTR_RE.exec(raw)) !== null) {
+    unmatched += raw.slice(cursor, match.index);
+    cursor = ATTR_RE.lastIndex;
+
+    const name = match[1].toLowerCase();
+    const rawValue = match[2] ?? match[3] ?? match[4];
+    if (!ALLOWED_BLOCK_ATTRS.has(name) || seen.has(name)) {
+      changed = true;
+      continue;
+    }
+    seen.add(name);
+
+    if (rawValue === undefined) {
+      parts.push(name); // attributo booleano, es. `nowrap`
+      continue;
+    }
+
+    const text = blockAttrValue(name, rawValue);
+    if (text === null) {
+      changed = true;
+      continue;
+    }
+    if (text !== rawValue) changed = true;
+    parts.push(`${name}="${text}"`);
+  }
+  unmatched += raw.slice(cursor);
+
+  // Ciò che il parser degli attributi non ha riconosciuto può essere solo
+  // spaziatura o la barra di un tag autochiudente: qualsiasi altro residuo
+  // significa che il tag va riscritto invece di essere riemesso com'era.
+  if (/[^\s/]/.test(unmatched)) changed = true;
+
+  return { serialized: parts.length ? ` ${parts.join(' ')}` : '', changed };
+}
+
+/**
+ * Valore pronto per essere riscritto fra virgolette, oppure `null` se
+ * l'attributo va scartato. Gli attributi non-URL restano nella forma originale
+ * (sono già testo HTML): ri-escaparli rovinerebbe le entità nominate che
+ * `decodeBasicEntities` non conosce, come `&egrave;`.
+ */
+function blockAttrValue(name: string, rawValue: string): string | null {
+  if (name === 'href') {
+    const url = safeUrl(decodeBasicEntities(rawValue));
+    return url ? escapeAttr(url) : null;
+  }
+  if (name === 'src' || name === 'background') {
+    const url = safeImageUrl(decodeBasicEntities(rawValue));
+    return url ? escapeAttr(url) : null;
+  }
+  if (name === 'style') {
+    const style = sanitizeBlockStyleValue(decodeBasicEntities(rawValue));
+    return style ? escapeAttr(style) : null;
+  }
+  if (name === 'target') {
+    const target = rawValue.trim().toLowerCase();
+    return target === '_blank' || target === '_self' ? target : null;
+  }
+  if (name === 'rel') {
+    const tokens = rawValue
+      .split(/\s+/)
+      .map((token) => token.trim().toLowerCase())
+      .filter((token) => ALLOWED_REL_TOKENS.has(token));
+    return tokens.length ? Array.from(new Set(tokens)).join(' ') : null;
+  }
+  // I caratteri di controllo dentro un attributo servono solo a spezzare il
+  // parsing dei client; le virgolette doppie a uscire dall'attributo.
+  return rawValue.replace(/[\u0000-\u001F\u007F]/g, '').replace(/"/g, '&quot;');
+}
+
+/**
+ * Filtro dello `style` del blocco HTML.
+ *
+ * Qui, a differenza del testo ricco, l'operatore deve poter usare qualunque
+ * proprietà di layout: la whitelist è quindi sulla forma della proprietà (un
+ * identificatore CSS) e sui valori, che non possono contenere codice
+ * (`expression()`), import esterni o `url()` con schemi eseguibili.
+ */
+export function sanitizeBlockStyleValue(value: string): string {
+  if (!value) return '';
+  const parts: string[] = [];
+  for (const declaration of value.split(';')) {
+    const idx = declaration.indexOf(':');
+    if (idx <= 0) continue;
+    const prop = declaration.slice(0, idx).trim().toLowerCase();
+    const cssValue = declaration.slice(idx + 1).trim();
+    if (!/^-?[a-z][a-z0-9-]*$/.test(prop) || !cssValue) continue;
+    // `behavior` e `-moz-binding` caricano codice invece di descrivere stile.
+    if (/(?:binding|behaviou?r)$/.test(prop)) continue;
+    // La barra rovescia è l'escape CSS con cui si maschera uno schema (`\6a`).
+    if (/(?:expression\s*\(|@import|behaviou?r\s*:|binding\s*:|\\)/i.test(cssValue)) continue;
+    const opened = cssValue.match(/url\s*\(/gi)?.length ?? 0;
+    const closed = cssValue.match(/url\s*\([^)]*\)/gi) ?? [];
+    if (opened !== closed.length) continue; // `url(` non chiusa: valore malformato
+    if (closed.some((url) => !isSafeCssUrl(url))) continue;
+    parts.push(`${prop}:${cssValue}`);
+  }
+  return parts.join(';');
+}
+
+/** true se una `url(...)` dentro un valore CSS punta a una risorsa innocua. */
+function isSafeCssUrl(raw: string): boolean {
+  const inner = raw
+    .replace(/^url\s*\(/i, '')
+    .replace(/\)$/, '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/[\s\u0000-\u001F]/g, '')
+    .toLowerCase();
+  if (!inner) return false;
+  if (/^(?:javascript|vbscript|file|blob|about):/.test(inner)) return false;
+  if (inner.startsWith('data:') && !inner.startsWith('data:image/')) return false;
+  return true;
 }
 
 /**

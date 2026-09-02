@@ -1,6 +1,6 @@
 'use client';
 
-import { format, isSameMonth } from 'date-fns';
+import { format, isSameDay, isSameMonth } from 'date-fns';
 import { Plus } from 'lucide-react';
 import * as React from 'react';
 
@@ -13,6 +13,49 @@ import { EntryChip } from './entry-chip';
 import { EntryRow } from './entry-row';
 import type { CalendarItem, CalendarRange } from './types';
 import { DATE_OPTIONS, dayId, formatFullDay, isPastDay, isToday, weekdayLabels } from './utils';
+
+/**
+ * "Oggi", aggiornato mentre la pagina resta aperta.
+ *
+ * Congelarlo al montaggio significherebbe che dopo la mezzanotte il giorno
+ * appena concluso continua a evidenziarsi come oggi e ad accettare i rilasci,
+ * pianificando un invio su una data già passata. Il ricalcolo scatta allo
+ * scoccare del giorno nuovo e al rientro sulla scheda, perché il browser
+ * rallenta o sospende i timer delle schede in secondo piano.
+ */
+function useToday(): Date {
+  const [today, setToday] = React.useState(() => new Date());
+
+  React.useEffect(() => {
+    let timer = 0;
+
+    const sync = () => {
+      const now = new Date();
+      // Il riferimento cambia solo a giorno nuovo: le celle non si ridisegnano
+      // a ogni risveglio della scheda.
+      setToday((previous) => (isSameDay(previous, now) ? previous : now));
+      const midnight = new Date(now);
+      midnight.setHours(24, 0, 0, 0);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(sync, midnight.getTime() - now.getTime() + 1_000);
+    };
+
+    const onWake = () => {
+      if (!window.document.hidden) sync();
+    };
+
+    sync();
+    window.document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('focus', onWake);
+    return () => {
+      window.clearTimeout(timer);
+      window.document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('focus', onWake);
+    };
+  }, []);
+
+  return today;
+}
 
 /** Il doppio clic crea una newsletter solo sullo spazio vuoto della cella. */
 function isEmptyAreaDoubleClick(event: React.MouseEvent<HTMLElement>): boolean {
@@ -42,7 +85,7 @@ export function MonthView({
   canCreate,
 }: MonthViewProps) {
   const labels = React.useMemo(() => weekdayLabels('EEE'), []);
-  const today = React.useMemo(() => new Date(), []);
+  const today = useToday();
 
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card shadow-card">

@@ -93,12 +93,30 @@ function isMissingIndexError(error: unknown): boolean {
   return /requires an index|FAILED_PRECONDITION.*index/i.test(message);
 }
 
+/** Documenti letti in un colpo solo con `getAll`. */
+const CONTACT_READ_CHUNK = 300;
+
+/**
+ * Campi che bastano a decidere se un contatto è un destinatario valido.
+ * Usati come proiezione quando serve solo il conteggio del pubblico: un
+ * documento `Contact` intero porta con sé statistiche, stampanti e attributi
+ * personalizzati che nel conteggio non servono e che, moltiplicati per
+ * centinaia di migliaia di destinatari, esaurirebbero la memoria.
+ */
+const AUDIENCE_FIELD_MASK: string[] = [
+  'status',
+  'email',
+  'emailNormalized',
+  'engagement.lastSentAt',
+  'stats.lastOrderAt',
+];
+
 /** Carica i contatti indicati, a blocchi, saltando i documenti inesistenti. */
 export async function loadContactsByIds(ids: readonly string[]): Promise<Contact[]> {
   const unique = Array.from(new Set(ids.filter(Boolean)));
   if (unique.length === 0) return [];
 
-  const blocks = chunk(unique, 300);
+  const blocks = chunk(unique, CONTACT_READ_CHUNK);
   const pages = await mapWithConcurrency(blocks, 4, async (block) => {
     const refs = block.map((id) => col.contacts().doc(id));
     const snapshots = await db.getAll(...refs);
@@ -801,56 +819,93 @@ export async function resolveAudience(
     warnings.push(`Pubblico troncato a ${limit} destinatari.`);
   }
 
-  const contacts = await loadContactsByIds(candidates);
-  reasons.not_found += candidates.length - contacts.length;
-
   const contactedWindow = audience.suppressIfContactedWithinDays ?? null;
   const purchasedWindow = audience.suppressIfPurchasedWithinDays ?? null;
+  const includeContacts = options.includeContacts !== false;
+
+  // I candidati si filtrano a blocchi, senza mai accumulare l'intera rubrica:
+  // quando serve solo il numero (stima del pubblico) si leggono i soli campi
+  // che decidono la contattabilità, perché i documenti interi di centinaia di
+  // migliaia di contatti non stanno nella memoria della Function.
+  const pages = await mapWithConcurrency(
+    chunk(candidates, CONTACT_READ_CHUNK),
+    4,
+    async (block) => {
+      const refs = block.map((id) => col.contacts().doc(id));
+      const snapshots = includeContacts
+        ? await db.getAll(...refs)
+        : await db.getAll(...refs, { fieldMask: AUDIENCE_FIELD_MASK });
+
+      const pageReasons = emptyAudienceReasons();
+      const kept: Array<{ id: DocId; email: string; contact: Contact | null }> = [];
+
+      for (const snapshot of snapshots) {
+        if (!snapshot.exists) {
+          pageReasons.not_found += 1;
+          continue;
+        }
+        const contact = withId<Contact>(snapshot);
+        if (!SENDABLE_STATUSES.includes(contact.status)) {
+          pageReasons.not_sendable += 1;
+          continue;
+        }
+        const email = contact.emailNormalized || normalizeEmail(contact.email ?? '');
+        if (!email || !isValidEmail(email)) {
+          pageReasons.invalid_email += 1;
+          continue;
+        }
+        if (contactedWindow !== null && contactedWindow > 0) {
+          const lastSent = contact.engagement?.lastSentAt ? Date.parse(contact.engagement.lastSentAt) : NaN;
+          if (Number.isFinite(lastSent) && lastSent >= now - contactedWindow * 86_400_000) {
+            pageReasons.suppressed_recently_contacted += 1;
+            continue;
+          }
+        }
+        if (purchasedWindow !== null && purchasedWindow > 0) {
+          const lastOrder = contact.stats?.lastOrderAt ? Date.parse(contact.stats.lastOrderAt) : NaN;
+          if (Number.isFinite(lastOrder) && lastOrder >= now - purchasedWindow * 86_400_000) {
+            pageReasons.suppressed_recently_purchased += 1;
+            continue;
+          }
+        }
+        // Il documento proiettato è parziale: si trattiene solo quando il
+        // chiamante lo ha chiesto per intero, mai per la sola stima.
+        kept.push({ id: contact.id, email, contact: includeContacts ? contact : null });
+      }
+
+      return { kept, reasons: pageReasons };
+    },
+  );
+
+  // La deduplica per email è globale e si applica scorrendo i blocchi nel loro
+  // ordine, così l'esito non dipende da quale lettura è tornata per prima.
   const seenEmails = new Set<string>();
+  const contactIds: DocId[] = [];
   const selected: Contact[] = [];
-
-  for (const contact of contacts) {
-    if (!SENDABLE_STATUSES.includes(contact.status)) {
-      reasons.not_sendable += 1;
-      continue;
+  for (const page of pages) {
+    for (const [reason, count] of Object.entries(page.reasons) as Array<[AudienceExclusionReason, number]>) {
+      reasons[reason] += count;
     }
-    const email = contact.emailNormalized || normalizeEmail(contact.email ?? '');
-    if (!email || !isValidEmail(email)) {
-      reasons.invalid_email += 1;
-      continue;
-    }
-    if (seenEmails.has(email)) {
-      reasons.duplicate_email += 1;
-      continue;
-    }
-    if (contactedWindow !== null && contactedWindow > 0) {
-      const lastSent = contact.engagement?.lastSentAt ? Date.parse(contact.engagement.lastSentAt) : NaN;
-      if (Number.isFinite(lastSent) && lastSent >= now - contactedWindow * 86_400_000) {
-        reasons.suppressed_recently_contacted += 1;
+    for (const entry of page.kept) {
+      if (seenEmails.has(entry.email)) {
+        reasons.duplicate_email += 1;
         continue;
       }
+      seenEmails.add(entry.email);
+      contactIds.push(entry.id);
+      if (entry.contact) selected.push(entry.contact);
     }
-    if (purchasedWindow !== null && purchasedWindow > 0) {
-      const lastOrder = contact.stats?.lastOrderAt ? Date.parse(contact.stats.lastOrderAt) : NaN;
-      if (Number.isFinite(lastOrder) && lastOrder >= now - purchasedWindow * 86_400_000) {
-        reasons.suppressed_recently_purchased += 1;
-        continue;
-      }
-    }
-
-    seenEmails.add(email);
-    selected.push(contact);
   }
 
   const excludedCount = Object.values(reasons).reduce((sum, value) => sum + value, 0);
 
-  if (selected.length === 0) {
+  if (contactIds.length === 0) {
     warnings.push('Nessun destinatario contattabile con questi criteri.');
   }
 
   return {
-    contactIds: selected.map((contact) => contact.id),
-    contacts: options.includeContacts === false ? [] : selected,
+    contactIds,
+    contacts: includeContacts ? selected : [],
     excludedCount,
     reasons,
     warnings,

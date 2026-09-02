@@ -4,11 +4,12 @@ node_modules/
 .pnp.js
 
 # builds
-dist/
-build/
-.next/
-out/
-lib/
+# Ancorate alla radice: una regola nuda come `lib/` escluderebbe anche
+# `functions/src/lib/` e `apps/web/src/lib/`, che sono codice sorgente.
+/packages/*/dist/
+/functions/lib/
+/apps/web/.next/
+/apps/web/out/
 *.tsbuildinfo
 
 # env

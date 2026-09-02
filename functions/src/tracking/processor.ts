@@ -603,6 +603,10 @@ export function computeEventEffect(
       if (!entry.firstOpenedAt) {
         effect.entryPatch.firstOpenedAt = at;
         effect.entryPatch.lastOpenedAt = at;
+        // `openCount` va incrementato come nel ramo apertura: è il campo da cui
+        // `recomputeNewsletterStats` ricostruisce le aperture totali, e senza di
+        // esso la riconciliazione oraria cancellerebbe questa apertura.
+        effect.entryPatch.openCount = FieldValue.increment(1);
         effect.statsDelta.uniqueOpened = 1;
         effect.statsDelta.opened = 1;
         effect.stepDelta.opened = 1;
@@ -893,6 +897,88 @@ export async function applyAutomationStatsDelta(
 }
 
 // -----------------------------------------------------------------------------
+// Conversioni di un destinatario
+// -----------------------------------------------------------------------------
+
+/**
+ * Una conversione registrata su un destinatario (o su una `run` di automazione).
+ *
+ * Un destinatario può acquistare più volte dopo lo stesso invio e, con i modelli
+ * multi-touch, un singolo ordine può essere diviso fra più invii: `weight` è la
+ * quota di ordine spettante a questo invio (la somma su tutti gli invii vale 1)
+ * e `revenue` il fatturato corrispondente.
+ */
+export interface RecipientConversion {
+  orderId: string;
+  at: string | null;
+  revenue: number;
+  weight: number;
+}
+
+/** Istante confrontabile, tollerante ai valori mancanti o malformati. */
+function conversionTime(value: string | null): number {
+  const parsed = Date.parse(value ?? '');
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+/**
+ * Elenco delle conversioni di un destinatario.
+ *
+ * I documenti scritti prima dell'introduzione di `conversions` hanno solo i
+ * campi singoli (`convertedOrderId`, `convertedAt`, `revenue`): vengono letti
+ * come una conversione sola, così il ricalcolo non perde lo storico.
+ */
+export function readRecipientConversions(data: Record<string, unknown>): RecipientConversion[] {
+  const raw = data.conversions;
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+      .filter((item) => typeof item.orderId === 'string' && item.orderId.length > 0)
+      .map((item) => {
+        const weight = Number(item.weight);
+        return {
+          orderId: String(item.orderId),
+          at: typeof item.at === 'string' ? item.at : null,
+          revenue: Number(item.revenue ?? 0),
+          // Peso assente: il documento precede i modelli multi-touch, l'ordine
+          // era intero.
+          weight: Number.isFinite(weight) ? weight : 1,
+        };
+      });
+  }
+
+  const legacyOrderId = typeof data.convertedOrderId === 'string' ? data.convertedOrderId : null;
+  if (!legacyOrderId) return [];
+  return [
+    {
+      orderId: legacyOrderId,
+      at: typeof data.convertedAt === 'string' ? data.convertedAt : null,
+      revenue: Number(data.revenue ?? 0),
+      weight: 1,
+    },
+  ];
+}
+
+/**
+ * Campi di conversione derivati dall'elenco.
+ *
+ * `convertedOrderId`, `convertedAt` e `revenue` restano scritti per le viste che
+ * li leggono ancora (report destinatari, report automazioni): rappresentano
+ * l'ultimo ordine e il fatturato complessivo attribuito al destinatario.
+ */
+export function conversionsPatch(conversions: RecipientConversion[]): Record<string, unknown> {
+  const sorted = [...conversions].sort((a, b) => conversionTime(a.at) - conversionTime(b.at));
+  const last = sorted.length > 0 ? sorted[sorted.length - 1]! : null;
+  const revenue = Math.round(sorted.reduce((sum, item) => sum + Number(item.revenue ?? 0), 0) * 100) / 100;
+  return {
+    conversions: sorted,
+    convertedOrderId: last?.orderId ?? null,
+    convertedAt: last?.at ?? null,
+    revenue: last ? revenue : null,
+  };
+}
+
+// -----------------------------------------------------------------------------
 // processEvent
 // -----------------------------------------------------------------------------
 
@@ -916,6 +1002,16 @@ export async function processEvent(event: TrackingEvent): Promise<ProcessEventRe
     contactId: event.contactId ?? null,
     skipped: null,
   };
+
+  // Gli invii di prova portano il `newsletterId` reale ma non sono traffico:
+  // non toccano statistiche, destinatari e attribuzione, esattamente come già
+  // fa il redirector (`redirect.ts`). L'evento resta salvato e viene marcato
+  // elaborato, altrimenti la riconciliazione oraria continuerebbe a riprenderlo.
+  if (event.source === 'test') {
+    await markEventProcessed(event.id, {});
+    result.skipped = 'invio_di_prova';
+    return result;
+  }
 
   let target: ResolvedTarget | null = null;
   try {
@@ -1037,13 +1133,18 @@ export async function processEvent(event: TrackingEvent): Promise<ProcessEventRe
   // un'automazione viene riclassificato: i report filtrano per `source`.
   if (target && event.source === 'transactional') enrichment.source = target.kind;
 
-  await col
-    .events()
-    .doc(event.id)
-    .set({ ...enrichment, processed: true, processingError: null, processedAt: nowIso() }, { merge: true });
+  await markEventProcessed(event.id, enrichment);
 
   if (!target) result.skipped = 'invio_non_correlato';
   return result;
+}
+
+/** Chiude l'elaborazione dell'evento: id risolti e flag `processed`. */
+async function markEventProcessed(eventId: string, enrichment: Record<string, unknown>): Promise<void> {
+  await col
+    .events()
+    .doc(eventId)
+    .set({ ...enrichment, processed: true, processingError: null, processedAt: nowIso() }, { merge: true });
 }
 
 /** Scrive (o riscrive) il tocco di attribuzione legato all'evento. */
@@ -1124,21 +1225,28 @@ export async function recomputeNewsletterStats(newsletterId: string): Promise<Ne
         'unsubscribedAt',
         'bouncedAt',
         'convertedOrderId',
+        'convertedAt',
+        'conversions',
         'revenue',
       )
       .orderBy('__name__'),
     500,
     async (docs) => {
       for (const doc of docs) {
-        const data = doc.data() as Partial<NewsletterRecipient> & { proxyOpenCount?: number };
+        const raw = doc.data() as Record<string, unknown>;
+        const data = raw as Partial<NewsletterRecipient> & { proxyOpenCount?: number };
         const variantId = data.variantId ?? null;
+        const conversions = readRecipientConversions(raw);
 
         bump(variantId, (target) => {
           target.recipients += 1;
           if (data.sentAt) target.requested += 1;
           if (data.deliveredAt) target.delivered += 1;
           if (data.firstOpenedAt) target.uniqueOpened += 1;
-          target.opened += Number(data.openCount ?? 0);
+          // Un'apertura c'è stata di sicuro se esiste `firstOpenedAt`: i
+          // documenti scritti prima della correzione del click (apertura
+          // implicita senza `openCount`) non devono perderla.
+          target.opened += Math.max(Number(data.openCount ?? 0), data.firstOpenedAt ? 1 : 0);
           if (data.firstClickedAt) target.uniqueClicked += 1;
           target.clicked += Number(data.clickCount ?? 0);
           if (data.unsubscribedAt) target.unsubscribed += 1;
@@ -1146,23 +1254,39 @@ export async function recomputeNewsletterStats(newsletterId: string): Promise<Ne
           if (data.status === 'hard_bounced') target.hardBounces += 1;
           if (data.status === 'blocked') target.blocked += 1;
           if (data.status === 'spam') target.complaints += 1;
-          if (data.convertedOrderId) {
-            target.orders += 1;
-            target.revenue += Number(data.revenue ?? 0);
+          // Un destinatario può aver acquistato più volte, e un ordine diviso
+          // fra più invii vale qui solo la sua quota: la somma su tutti i canali
+          // resta un ordine e il fatturato dell'ordine.
+          for (const conversion of conversions) {
+            target.orders += conversion.weight;
+            target.revenue += conversion.revenue;
           }
         });
       }
     },
   );
 
-  const finalStats: NewsletterStats = { ...stats, ...computeRates(stats), updatedAt: nowIso() };
+  // Ordini e fatturato sono somme di quote frazionarie: si arrotondano una
+  // volta sola, alla fine, per non trascinare l'errore in virgola mobile.
+  const settle = (totals: NewsletterStats): NewsletterStats => ({
+    ...totals,
+    orders: Math.round(totals.orders * 100) / 100,
+    revenue: Math.round(totals.revenue * 100) / 100,
+  });
+
+  const settled = settle(stats);
+  const finalStats: NewsletterStats = { ...settled, ...computeRates(settled), updatedAt: nowIso() };
 
   const patch: Record<string, unknown> = { stats: finalStats };
   if (newsletter.variants?.length) {
     patch.variants = newsletter.variants.map((variant) => {
       const totals = variantTotals.get(variant.id);
       if (!totals) return variant;
-      return { ...variant, stats: { ...totals, ...computeRates(totals), updatedAt: nowIso() } };
+      const variantStats = settle(totals);
+      return {
+        ...variant,
+        stats: { ...variantStats, ...computeRates(variantStats), updatedAt: nowIso() },
+      };
     });
   }
 

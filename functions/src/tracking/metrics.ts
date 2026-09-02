@@ -185,12 +185,23 @@ export interface DailyMetrics {
   computedAt: IsoDate;
 }
 
+/**
+ * Evento generato da un invio di prova.
+ *
+ * Le prove portano il `newsletterId` reale (serve a comporre il messaggio) ma
+ * non sono traffico: vanno escluse dai conteggi, come già fa il redirector.
+ */
+function isTestEvent(event: { source?: SendSource | null }): boolean {
+  return event.source === 'test';
+}
+
 /** Canale di un evento: dagli id risolti, non dal campo `source` grezzo. */
 function channelOf(event: {
   newsletterId?: string | null;
   automationId?: string | null;
   source?: SendSource | null;
 }): 'newsletter' | 'automation' | null {
+  if (isTestEvent(event)) return null;
   if (event.newsletterId) return 'newsletter';
   if (event.automationId) return 'automation';
   if (event.source === 'newsletter' || event.source === 'automation') return event.source;
@@ -304,6 +315,10 @@ export async function computeDailyMetrics(
           automationRunId?: string | null;
           email?: string;
         };
+        // Le prove non entrano nemmeno nel totale: `channels.total` viene
+        // sommato anche per gli eventi senza canale.
+        if (isTestEvent(data)) continue;
+
         const channel = channelOf(data);
         const key = `${data.newsletterId ?? data.automationRunId ?? data.automationId ?? '-'}|${data.email ?? '-'}`;
 
@@ -359,9 +374,14 @@ export async function computeDailyMetrics(
               ? channels.automation
               : null;
           if (!target) continue;
-          target.orders += attribution.weight >= 1 ? 1 : attribution.weight;
+          // Un ordine è un ordine: il peso lo ripartisce fra i canali, non lo
+          // moltiplica. Peso assente (attribuzioni precedenti ai modelli
+          // multi-touch): l'ordine era intero.
+          const weight = Number(attribution.weight);
+          const share = Number.isFinite(weight) && weight > 0 ? Math.min(1, weight) : 1;
+          target.orders += share;
           target.revenue += revenue;
-          channels.total.orders += attribution.weight >= 1 ? 1 : attribution.weight;
+          channels.total.orders += share;
           channels.total.revenue += revenue;
         }
       }

@@ -1,2 +1,3 @@
-lib/
+# Output del build TypeScript (ancorato: non deve toccare src/lib/).
+/lib/
 node_modules/

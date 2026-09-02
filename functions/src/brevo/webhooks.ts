@@ -7,11 +7,16 @@
  * payload recapitato al nostro endpoint è in snake_case (`hard_bounce`,
  * `unique_opened`, `list_addition`). Qui teniamo le due tabelle di conversione
  * in un posto solo: il resto dell'app ragiona sempre in `BrevoEventType`.
+ *
+ * L'URL che registriamo su Brevo porta sempre `?token=<BREVO_WEBHOOK_SECRET>`:
+ * è l'unica credenziale che Brevo sa trasmettere (niente header personalizzati)
+ * ed è quella che `brevoWebhook` verifica. L'URL restituito e salvato in
+ * `settings/brevo` è invece quello nudo, senza segreto.
  */
 
 import { BREVO_EVENT_TYPES } from '@alphaink/shared';
 import type { BrevoEventType, IsoDate } from '@alphaink/shared';
-import { REGION } from '../lib/config';
+import { BREVO_WEBHOOK_SECRET, REGION } from '../lib/config';
 import { AppError } from '../lib/errors';
 import { createLogger } from '../lib/logger';
 import { brevoRequest, gcpProjectId } from './client';
@@ -134,6 +139,46 @@ export function resolveWebhookUrl(appUrl?: string | null): string {
   return `${base}/api/brevo/webhook`;
 }
 
+/** Segreto condiviso con `brevoWebhook`. Stringa vuota se non configurato. */
+function webhookSecret(): string {
+  try {
+    return (BREVO_WEBHOOK_SECRET.value() ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * URL davvero registrato su Brevo: quello di ricezione più il token.
+ *
+ * Brevo non permette di aggiungere header personalizzati alla chiamata, quindi
+ * `?token=<segreto>` è l'unica credenziale che il nostro endpoint può ricevere
+ * (`tracking/webhook.ts`, `authenticateWebhook`). Senza, ogni evento reale
+ * viene respinto con 401 e il tracciamento resta a zero.
+ */
+export function webhookUrlWithToken(url: string, token: string): string {
+  if (!token) return url;
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set('token', token);
+    return parsed.toString();
+  } catch {
+    // URL non assoluto (configurazione insolita): si compone testualmente.
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}token=${encodeURIComponent(token)}`;
+  }
+}
+
+/**
+ * Confronta due URL ignorando query e frammento: il token nella query cambia a
+ * ogni rotazione del segreto e non deve far sembrare "nuovo" un webhook che
+ * esiste già, altrimenti su Brevo se ne accumula uno per rotazione.
+ */
+function sameEndpoint(a: string, b: string): boolean {
+  const strip = (value: string): string => value.trim().split('#')[0].split('?')[0].replace(/\/+$/, '');
+  return strip(a) === strip(b);
+}
+
 // -----------------------------------------------------------------------------
 // CRUD
 // -----------------------------------------------------------------------------
@@ -236,23 +281,38 @@ async function ensureWebhook(
   apiKey: string,
   type: BrevoWebhookType,
   url: string,
+  registeredUrl: string,
   events: BrevoEventType[],
   description: string,
 ): Promise<{ webhook: RegisteredWebhook; created: boolean; updated: boolean }> {
   const wanted = toBrevoWebhookEvents(events);
-  const existing = (await listBrevoWebhooks(apiKey, type)).find(
-    (webhook) => webhook.url.trim() === url,
+  const existing = (await listBrevoWebhooks(apiKey, type)).find((webhook) =>
+    sameEndpoint(webhook.url, url),
   );
 
   if (!existing) {
-    const { id } = await createBrevoWebhook(apiKey, { url, events: wanted, type, description });
+    const { id } = await createBrevoWebhook(apiKey, {
+      url: registeredUrl,
+      events: wanted,
+      type,
+      description,
+    });
+    // Si logga e si persiste l'URL senza token: il segreto non deve finire né
+    // nei log né su Firestore (settings/brevo è leggibile da tutta la console).
     log.info('Webhook Brevo creato', { id, type, url });
     return { webhook: { id, url, type, events: wanted, createdAt: null }, created: true, updated: false };
   }
 
-  if (!sameEvents(existing.events ?? [], wanted)) {
-    await updateBrevoWebhook(apiKey, existing.id, { url, events: wanted, description });
-    log.info('Webhook Brevo aggiornato', { id: existing.id, type, url });
+  // L'URL va riallineato anche quando gli eventi coincidono: è il caso del
+  // segreto ruotato, o di un webhook registrato prima senza token.
+  const urlChanged = existing.url.trim() !== registeredUrl;
+  if (urlChanged || !sameEvents(existing.events ?? [], wanted)) {
+    await updateBrevoWebhook(apiKey, existing.id, {
+      url: registeredUrl,
+      events: wanted,
+      description,
+    });
+    log.info('Webhook Brevo aggiornato', { id: existing.id, type, url, urlChanged });
     return {
       webhook: { id: existing.id, url, type, events: wanted, createdAt: existing.createdAt ?? null },
       created: false,
@@ -275,19 +335,33 @@ async function ensureWebhook(
 
 /**
  * Garantisce l'esistenza dei due webhook (transazionale e marketing) puntati
- * sull'endpoint `brevoWebhook`. È idempotente: se esistono già con gli stessi
- * eventi non tocca nulla.
+ * sull'endpoint `brevoWebhook`. È idempotente: se esistono già con lo stesso
+ * URL e gli stessi eventi non tocca nulla.
+ *
+ * L'URL registrato porta il token in query; quello restituito (e persistito in
+ * `settings/brevo.webhooks`) no, perché quel documento è leggibile da chiunque
+ * abbia accesso alla console.
  */
 export async function syncBrevoWebhooks(
   apiKey: string,
   appUrl?: string | null,
 ): Promise<SyncWebhooksResult> {
   const url = resolveWebhookUrl(appUrl);
+  const secret = webhookSecret();
+  if (!secret) {
+    throw new AppError(
+      'failed_precondition',
+      'Segreto del webhook non configurato: imposta BREVO_WEBHOOK_SECRET prima di registrare i webhook, ' +
+        'altrimenti Brevo riceverebbe 401 su ogni evento.',
+    );
+  }
+  const registeredUrl = webhookUrlWithToken(url, secret);
 
   const transactional = await ensureWebhook(
     apiKey,
     'transactional',
     url,
+    registeredUrl,
     TRANSACTIONAL_WEBHOOK_EVENTS,
     'AlphaInk Newsletter — eventi transazionali',
   );
@@ -295,6 +369,7 @@ export async function syncBrevoWebhooks(
     apiKey,
     'marketing',
     url,
+    registeredUrl,
     MARKETING_WEBHOOK_EVENTS,
     'AlphaInk Newsletter — eventi campagne',
   );

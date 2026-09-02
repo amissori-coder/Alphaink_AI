@@ -24,7 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { useAuth } from '@/lib/auth-context';
 import { useDocumentQuery } from '@/lib/hooks/use-document';
-import { toastError } from '@/lib/toast';
+import { errorMessage, toast, toastError } from '@/lib/toast';
 import { cn, relativeTimeIt } from '@/lib/utils';
 
 import { toNewsletterInput, updateNewsletter } from './api';
@@ -51,7 +51,9 @@ export interface EditorShellProps {
  * Il documento vive nello stato locale: le modifiche vengono salvate 1,5
  * secondi dopo l'ultima digitazione (o subito con ⌘S / Ctrl+S) e la barra in
  * alto racconta sempre a che punto è il salvataggio. Chiudere la scheda con
- * modifiche non salvate richiede una conferma del browser.
+ * modifiche non salvate richiede una conferma del browser, mentre uscire
+ * dall'editor (barra laterale, ricerca globale, freccia "indietro") forza il
+ * salvataggio in sospeso e avvisa con un toast se non è andato a buon fine.
  */
 export function EditorShell({ newsletterId }: EditorShellProps) {
   const { can } = useAuth();
@@ -102,14 +104,22 @@ export function EditorShell({ newsletterId }: EditorShellProps) {
   // volo, al termine si resta in stato "da salvare" invece di dichiarare tutto
   // salvato e perdere l'ultima battuta.
   const versionRef = React.useRef(0);
+  // Ultima versione arrivata a destinazione: il confronto con `versionRef` dice
+  // se c'è ancora qualcosa da salvare, indipendentemente dallo stato mostrato.
+  const savedVersionRef = React.useRef(0);
+  // Versione del salvataggio in volo: evita di rispedirla una seconda volta.
+  const savingVersionRef = React.useRef<number | null>(null);
 
-  const save = React.useCallback(async (): Promise<boolean> => {
+  const save = React.useCallback(async (
+    options: { errorTitle?: string } = {},
+  ): Promise<boolean> => {
     const current = stateRef.current;
     const version = versionRef.current;
     if (!current.newsletter || !current.doc) return false;
 
     setSaveState('saving');
     setSaveError(null);
+    savingVersionRef.current = version;
     try {
       const result = await mutation.mutateAsync({
         ...toNewsletterInput(current.newsletter),
@@ -118,17 +128,25 @@ export function EditorShell({ newsletterId }: EditorShellProps) {
         subject: current.subject.trim() || current.newsletter.subject,
         preheader: current.preheader.trim() ? current.preheader.trim() : null,
       });
+      savedVersionRef.current = version;
       setSaveState(versionRef.current === version ? 'saved' : 'dirty');
       setSavedAt(result.newsletter.updatedAt ?? new Date().toISOString());
       void queryClient.invalidateQueries({ queryKey: [...NEWSLETTER_QUERY_ROOT] });
       return true;
     } catch (caught) {
       setSaveState('error');
-      setSaveError(
-        caught instanceof Error ? caught.message : 'Salvataggio non riuscito. Riprova.',
-      );
-      toastError(caught, 'Salvataggio non riuscito.');
+      const detail = errorMessage(caught, 'Salvataggio non riuscito. Riprova.');
+      setSaveError(detail);
+      if (options.errorTitle) {
+        // Chi esce dall'editor deve leggere subito la conseguenza; la causa
+        // resta nella descrizione, così resta comunque un solo avviso.
+        toast.error(options.errorTitle, { description: detail });
+      } else {
+        toastError(caught, 'Salvataggio non riuscito.');
+      }
       return false;
+    } finally {
+      if (savingVersionRef.current === version) savingVersionRef.current = null;
     }
   }, [mutation, queryClient]);
 
@@ -158,6 +176,27 @@ export function EditorShell({ newsletterId }: EditorShellProps) {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [save, readOnly]);
+
+  // Uscita dall'editor: il salvataggio in sospeso va portato a termine comunque.
+  // La navigazione client-side di Next non emette `beforeunload` e smonta il
+  // componente cancellando il timer dell'autosave, quindi senza questo flush un
+  // clic sulla barra laterale entro AUTOSAVE_DEBOUNCE_MS perderebbe l'ultima
+  // modifica in silenzio. Il ref evita di riavviare l'effetto a ogni render.
+  const saveRef = React.useRef(save);
+  saveRef.current = save;
+  React.useEffect(
+    () => () => {
+      // Niente flush se la versione corrente è già salvata o è quella che sta
+      // partendo proprio ora: la richiesta in volo prosegue anche a componente
+      // smontato ed è già lei ad avvisare in caso di errore.
+      if (versionRef.current === savedVersionRef.current) return;
+      if (versionRef.current === savingVersionRef.current) return;
+      void saveRef.current({
+        errorTitle: 'Alcune modifiche alla newsletter non sono state salvate.',
+      });
+    },
+    [],
+  );
 
   // Avviso del browser se si chiude la scheda con modifiche in sospeso.
   const unsaved = saveState === 'dirty' || saveState === 'saving' || saveState === 'error';
@@ -262,7 +301,17 @@ export function EditorShell({ newsletterId }: EditorShellProps) {
             <Button
               size="sm"
               onClick={async () => {
-                if (unsaved) await save();
+                // La pianificazione lavora sul documento salvato: aprirla dopo
+                // un salvataggio fallito farebbe spedire la versione vecchia
+                // mentre a schermo si continua a vedere quella nuova.
+                if (
+                  unsaved &&
+                  !(await save({
+                    errorTitle: 'Impossibile pianificare: le modifiche non sono state salvate.',
+                  }))
+                ) {
+                  return;
+                }
                 setScheduleOpen(true);
               }}
             >

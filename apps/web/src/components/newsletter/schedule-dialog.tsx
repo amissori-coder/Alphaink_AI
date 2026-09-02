@@ -109,6 +109,35 @@ function parseTime(value: string): { hours: number; minutes: number } {
   };
 }
 
+/** Anno, mese (1-12) e giorno di un istante, letti nel fuso indicato. */
+function civilDateInZone(
+  instant: Date,
+  timeZone: string,
+): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(instant);
+  const read = (type: Intl.DateTimeFormatPartTypes): number =>
+    Number(parts.find((part) => part.type === type)?.value ?? '0');
+  return { year: read('year'), month: read('month'), day: read('day') };
+}
+
+/**
+ * Valore da dare al `DatePicker`, che ragiona sempre nell'orario del browser.
+ *
+ * La data scelta appartiene al fuso selezionato, non a quello del browser: per
+ * non farla slittare di un giorno quando i due fusi divergono, il giorno civile
+ * viene codificato come mezzogiorno locale — l'ora più lontana da entrambi i
+ * bordi del giorno — e riletto poi con `getFullYear/getMonth/getDate`.
+ * `Date` normalizza da sé un giorno fuori scala (es. 32 gennaio).
+ */
+function civilDateToPickerValue(year: number, month: number, day: number): string {
+  return new Date(year, month - 1, day, 12, 0, 0, 0).toISOString();
+}
+
 /** Orario "HH:mm" di un istante, letto nel fuso indicato. */
 function timeInZone(instant: Date, timeZone: string): string {
   const formatted = new Intl.DateTimeFormat('it-IT', {
@@ -164,14 +193,17 @@ export function ScheduleDialog({
     if (schedule?.sendAt) {
       const instant = new Date(schedule.sendAt);
       if (!Number.isNaN(instant.getTime())) {
-        setDate(instant.toISOString());
+        // Data e ora vanno lette nello stesso fuso, altrimenti riaprire il
+        // dialogo mostrerebbe il giorno del browser accanto all'ora del fuso
+        // scelto e la conferma sposterebbe l'invio di un giorno.
+        const civil = civilDateInZone(instant, zone);
+        setDate(civilDateToPickerValue(civil.year, civil.month, civil.day));
         setTime(timeInZone(instant, zone));
       }
     } else {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(9, 0, 0, 0);
-      setDate(tomorrow.toISOString());
+      // Domani nel fuso scelto, non in quello del browser.
+      const today = civilDateInZone(new Date(), zone);
+      setDate(civilDateToPickerValue(today.year, today.month, today.day + 1));
       setTime(DEFAULT_SEND_TIME);
     }
 
@@ -184,8 +216,20 @@ export function ScheduleDialog({
     setOptimize(Boolean(schedule?.optimizeSendTime));
   }, [open]);
 
+  // Primo giorno selezionabile: "oggi" nel fuso scelto, non in quello del
+  // browser. Dipende da `open` perché la pagina può restare aperta oltre la
+  // mezzanotte: a ogni riapertura del dialogo il limite viene ricalcolato.
+  const minDate = React.useMemo(() => {
+    if (!open) return undefined;
+    const today = civilDateInZone(new Date(), timezone);
+    return new Date(today.year, today.month - 1, today.day, 12, 0, 0, 0);
+  }, [open, timezone]);
+
   const sendAt = React.useMemo(() => {
     if (!date) return null;
+    // `date` contiene il giorno civile del fuso scelto codificato come
+    // mezzogiorno locale: anno, mese e giorno si rileggono quindi con i
+    // getter locali, e l'orario resta quello impostato nel fuso scelto.
     const parsed = new Date(date);
     if (Number.isNaN(parsed.getTime())) return null;
     const { hours, minutes } = parseTime(time);
@@ -265,7 +309,7 @@ export function ScheduleDialog({
                 id="pianifica-data"
                 value={date}
                 onChange={setDate}
-                minDate={new Date()}
+                minDate={minDate}
                 clearable={false}
                 invalid={inThePast}
                 disabled={busy}

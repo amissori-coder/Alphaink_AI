@@ -34,6 +34,7 @@
 import { createHash } from 'node:crypto';
 import { LIMITS, SENDABLE_STATUSES, displayNameFor, normalizeEmail, shiftOutOfQuietHours } from '@alphaink/shared';
 import type {
+  ApiErrorCode,
   Contact,
   DocId,
   IsoDate,
@@ -66,6 +67,7 @@ import { composeNewsletterEmail, customHeaderFor, loadNewsletterEnvironment, toC
 import type { NewsletterEnvironment } from './compose';
 import {
   bumpNewsletterStats,
+  getNewsletter,
   recipientsRef,
   requireNewsletter,
   transitionNewsletter,
@@ -99,6 +101,33 @@ export const MAX_BATCH_ATTEMPTS = 3;
 /** Attesa prima di riprovare un batch rimandato (chiave API assente, errori). */
 export const RETRY_DELAY_MINUTES = 15;
 
+/**
+ * Errori per cui è **certo** che nessuna email è partita: Brevo ha rifiutato la
+ * richiesta prima di consegnarla (chiave revocata, mittente non verificato,
+ * contenuto rifiutato, crediti o frequenza esauriti) oppure la chiamata non è
+ * nemmeno stata tentata.
+ *
+ * La distinzione conta perché decide la sorte dei destinatari del blocco:
+ *  - qui nulla è stato consegnato, quindi restano `pending` e il batch viene
+ *    ritentato per intero senza rischio di doppioni;
+ *  - per tutto il resto (timeout, errore di rete, 5xx) la consegna è incerta e
+ *    vale la regola opposta: destinatario `failed` e nessun ritentativo, meglio
+ *    un mancato invio tracciato che una seconda email al cliente.
+ */
+const NOT_DELIVERED_CODES: ApiErrorCode[] = [
+  'unauthenticated',
+  'permission_denied',
+  'invalid_argument',
+  'failed_precondition',
+  'rate_limited',
+  'resource_exhausted',
+];
+
+/** Vero se l'errore riguarda la spedizione nel suo insieme, non il destinatario. */
+function isSystemicSendFailure(error: unknown): boolean {
+  return error instanceof AppError && NOT_DELIVERED_CODES.includes(error.code);
+}
+
 // -----------------------------------------------------------------------------
 // Tipi della coda
 // -----------------------------------------------------------------------------
@@ -127,6 +156,37 @@ export interface SendBatch {
   updatedAt: IsoDate;
 }
 
+/**
+ * Esito di un batch già lavorato, dai suoi contatori.
+ *
+ * Un batch che non ha spedito una sola email non è un batch riuscito. Se si
+ * chiudesse come `sent` la coda risulterebbe esaurita senza errori e
+ * `finalizeNewsletterIfComplete` porterebbe la newsletter in `sent`, che è uno
+ * stato terminale (`ALLOWED_TRANSITIONS.sent = []`): l'operatore si ritroverebbe
+ * una spedizione "inviata" che nessuno ha ricevuto e nessun modo di riprovare.
+ *
+ * `skipped` non entra nel giudizio: un batch fatto di soli destinatari non più
+ * contattabili (disiscritti fra la preparazione e l'invio) ha fatto il suo
+ * lavoro, non è un guasto.
+ */
+export function batchOutcome(counters: { sent: number; failed: number }): SendBatchStatus {
+  return counters.sent === 0 && counters.failed > 0 ? 'failed' : 'sent';
+}
+
+/**
+ * Verdetto sulla spedizione quando la coda è esaurita: qualcosa è davvero
+ * partito?
+ *
+ * Incrocia due fonti indipendenti: i contatori dei batch (che un batch
+ * rilavorato può riscrivere) e `stats.requested`, che è cumulativo e non torna
+ * mai indietro. Basta che una delle due dica "qualcosa è partito" perché la
+ * spedizione conti come riuscita; se tacciono entrambe la newsletter va in
+ * `failed`, non in `sent`.
+ */
+export function deliveredSomething(totals: { sent: number }, requested: number): boolean {
+  return totals.sent > 0 || requested > 0;
+}
+
 /** Informazioni di coda salvate sulla newsletter (fuori dal tipo condiviso). */
 export interface NewsletterQueueInfo {
   preparedAt: IsoDate;
@@ -139,6 +199,16 @@ export interface NewsletterQueueInfo {
 
 interface NewsletterWithQueue extends Newsletter {
   queue?: NewsletterQueueInfo | null;
+}
+
+/**
+ * Vero se la spedizione è già stata preparata (destinatari scritti e batch
+ * accodati). Da quel momento l'HTML salvato sul documento è quello che sta
+ * finendo nelle caselle: chi lo cambia manda due email diverse allo stesso
+ * pubblico.
+ */
+export function hasPreparedQueue(newsletter: Newsletter): boolean {
+  return Boolean((newsletter as NewsletterWithQueue).queue?.preparedAt);
 }
 
 function queueRef(): FirebaseFirestore.CollectionReference {
@@ -279,24 +349,39 @@ export async function dispatchNewsletter(
     // rimessa in moto. È il caso del "riprova" dopo un errore: i batch falliti
     // tornano in coda e i destinatari già serviti restano fuori (il loro stato
     // non è più `pending`).
-    await transitionNewsletter(newsletterId, 'sending', {
+    const restarted = await transitionNewsletter(newsletterId, 'sending', {
       expected: ['scheduled', 'queued', 'sending'],
       userId: options.userId ?? null,
       strict: false,
       patch: { failureReason: null },
     });
-    const retried = await requeueFailedBatches(newsletterId);
+
+    // La coda si tocca solo se la newsletter è davvero ripartita: su una
+    // spedizione ancora in pausa (transizione rifiutata) i batch devono
+    // restare sospesi.
+    //
+    // Oltre ai batch in errore vanno rimessi in coda anche quelli in pausa:
+    // "ripianifica" e "invia ora" riportano una newsletter `paused` in
+    // `scheduled`/`queued` e arrivano qui senza passare da `resumeNewsletter`.
+    // I batch `paused` non compaiono in nessuna query di invio ma contano come
+    // aperti, quindi la spedizione resterebbe ferma senza mai chiudersi.
+    const resumed = restarted ? await resumeNewsletterQueue(newsletterId) : 0;
+    const retried = restarted ? await requeueFailedBatches(newsletterId) : 0;
     log.info('Coda già preparata: spedizione ripresa', {
       newsletterId,
       batches: newsletter.queue.batches,
+      resumed,
       retried,
     });
+    const warnings: string[] = [];
+    if (resumed) warnings.push(`${resumed} batch sospesi sono stati rimessi in coda.`);
+    if (retried) warnings.push(`${retried} batch in errore sono stati rimessi in coda.`);
     return {
       newsletterId,
       recipients: newsletter.queue.recipients,
       batches: newsletter.queue.batches,
       alreadyPrepared: true,
-      warnings: retried ? [`${retried} batch in errore sono stati rimessi in coda.`] : [],
+      warnings,
     };
   }
 
@@ -624,21 +709,27 @@ export async function processSendBatch(
     base.skipped = claimed.contactIds.length - pending.length;
 
     if (!pending.length) {
+      // Nulla da fare: tutti i destinatari sono già stati serviti o esclusi da
+      // un passaggio precedente. I contatori di quel passaggio si conservano,
+      // azzerarli farebbe passare per riuscito un batch che non aveva spedito
+      // nulla e la newsletter si chiuderebbe come inviata.
+      const previous = { sent: claimed.sent ?? 0, failed: claimed.failed ?? 0 };
+      const status = batchOutcome(previous);
       await queueRef().doc(batchId).set(
         {
-          status: 'sent',
-          sent: 0,
-          failed: 0,
+          status,
+          sent: previous.sent,
+          failed: previous.failed,
           skipped: base.skipped,
           claimedAt: null,
           completedAt: nowIso(),
-          error: null,
+          error: status === 'failed' ? (claimed.error ?? 'Nessuna email inviata: destinatari in errore.') : null,
           updatedAt: nowIso(),
         },
         { merge: true },
       );
       await finalizeNewsletterIfComplete(claimed.newsletterId);
-      return { ...base, status: 'sent' };
+      return { ...base, status };
     }
 
     const contacts = await getContactsByIds(pending.map((snapshot) => snapshot.id));
@@ -702,6 +793,21 @@ export async function processSendBatch(
       }
 
       const email = contact.emailNormalized || normalizeEmail(contact.email ?? '');
+      if (!email) {
+        // Senza indirizzo il messaggio verrebbe rifiutato da Brevo con un 400
+        // che travolgerebbe l'intero blocco: è un problema del singolo
+        // contatto e va fermato qui.
+        base.failed += 1;
+        updates.push((batch) =>
+          batch.set(
+            snapshot.ref,
+            { status: 'failed', error: 'Indirizzo email mancante sul contatto.', updatedAt: nowIso() },
+            { merge: true },
+          ),
+        );
+        continue;
+      }
+
       prepared.push({
         contactId: contact.id,
         email,
@@ -747,16 +853,29 @@ export async function processSendBatch(
     const outcomes = await mapWithConcurrency(blocks, SEND_CONCURRENCY, async (block) => {
       try {
         const messageIds = await sendTransactionalBatch(apiKey, block.map((item) => item.message));
-        return { block, messageIds, error: null as string | null };
+        return { block, messageIds, error: null as string | null, systemic: false };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Errore di invio';
         log.error('Blocco di invio non riuscito', error, { batchId, size: block.length });
-        return { block, messageIds: {} as Record<string, string>, error: message };
+        return {
+          block,
+          messageIds: {} as Record<string, string>,
+          error: message,
+          systemic: isSystemicSendFailure(error),
+        };
       }
     });
 
+    // Guasto della spedizione, non del destinatario: Brevo ha rifiutato la
+    // richiesta e nulla è partito. I destinatari di quei blocchi restano
+    // `pending` (verranno serviti dal ritentativo) e il batch si interrompe:
+    // chiuderlo come riuscito porterebbe la newsletter in `sent`, che è
+    // terminale, con zero email spedite e nessuna via di recupero.
+    const systemic = outcomes.find((outcome) => outcome.systemic);
+
     const sentAt = nowIso();
     for (const outcome of outcomes) {
+      if (outcome.systemic) continue;
       for (const item of outcome.block) {
         const ref = recipientsRef(claimed.newsletterId).doc(item.contactId);
         if (outcome.error) {
@@ -787,6 +906,9 @@ export async function processSendBatch(
       }
     }
 
+    // Le scritture si salvano comunque, anche quando si sta per interrompere il
+    // batch: chi ha già ricevuto l'email deve uscire da `pending` prima del
+    // ritentativo, altrimenti la riceverebbe due volte.
     await commitInBatches(updates);
 
     // --- Contatori e chiusura del batch --------------------------------------
@@ -794,15 +916,23 @@ export async function processSendBatch(
       await bumpNewsletterStats(claimed.newsletterId, { requested: base.sent });
     }
 
+    if (systemic) {
+      throw new AppError('failed_precondition', systemic.error ?? 'Invio rifiutato da Brevo.');
+    }
+
+    // Un batch senza un solo invio riuscito si chiude in errore, così resta
+    // visibile in cronologia e `requeueFailedBatches` può riprenderlo.
+    const completed = batchOutcome(base);
+
     await queueRef().doc(batchId).set(
       {
-        status: 'sent',
+        status: completed,
         sent: base.sent,
         failed: base.failed,
         skipped: base.skipped,
         claimedAt: null,
         completedAt: nowIso(),
-        error: null,
+        error: completed === 'failed' ? 'Nessuna email inviata: tutti i destinatari in errore.' : null,
         updatedAt: nowIso(),
       },
       { merge: true },
@@ -813,11 +943,12 @@ export async function processSendBatch(
     log.info('Batch di invio completato', {
       batchId,
       newsletterId: claimed.newsletterId,
+      status: completed,
       sent: base.sent,
       failed: base.failed,
       skipped: base.skipped,
     });
-    return base;
+    return { ...base, status: completed };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Errore sconosciuto';
     const exhausted = (claimed.attempts ?? 1) >= MAX_BATCH_ATTEMPTS;
@@ -841,10 +972,37 @@ export async function processSendBatch(
 // Chiusura della spedizione
 // -----------------------------------------------------------------------------
 
-/** Vero se non restano batch da lavorare per la newsletter. */
-async function hasOpenBatches(newsletterId: DocId): Promise<boolean> {
-  const open = await batchesOf(newsletterId, ['pending', 'processing', 'paused']);
-  return open.length > 0;
+/** Riepilogo della coda di una newsletter: batch aperti ed esito complessivo. */
+interface QueueTotals {
+  /** Batch ancora da lavorare: in coda, presi in carico o sospesi. */
+  open: number;
+  failedBatches: number;
+  sent: number;
+  failed: number;
+}
+
+/**
+ * Conteggi della coda in una sola lettura.
+ *
+ * Si leggono `status` e i contatori (`select`): i `contactIds` pesano decine di
+ * KB per documento e qui non servono. Nessun `limit`: un troncamento
+ * falserebbe i totali su cui si decide l'esito della spedizione.
+ */
+async function queueTotals(newsletterId: DocId): Promise<QueueTotals> {
+  const snapshot = await queueRef()
+    .where('newsletterId', '==', newsletterId)
+    .select('status', 'sent', 'failed')
+    .get();
+
+  const totals: QueueTotals = { open: 0, failedBatches: 0, sent: 0, failed: 0 };
+  for (const doc of snapshot.docs) {
+    const status = (doc.get('status') as SendBatchStatus) ?? 'pending';
+    if (status === 'pending' || status === 'processing' || status === 'paused') totals.open += 1;
+    if (status === 'failed') totals.failedBatches += 1;
+    totals.sent += Number(doc.get('sent')) || 0;
+    totals.failed += Number(doc.get('failed')) || 0;
+  }
+  return totals;
 }
 
 /**
@@ -852,9 +1010,41 @@ async function hasOpenBatches(newsletterId: DocId): Promise<boolean> {
  * Idempotente: se la newsletter non è più in `sending` non fa nulla.
  */
 export async function finalizeNewsletterIfComplete(newsletterId: DocId): Promise<boolean> {
-  if (await hasOpenBatches(newsletterId)) return false;
+  const totals = await queueTotals(newsletterId);
+  if (totals.open > 0) return false;
 
+  const newsletter = await getNewsletter(newsletterId);
+  if (!newsletter) return false;
   const completedAt = nowIso();
+
+  // Coda esaurita senza un solo invio riuscito: la spedizione è fallita, non
+  // completata. `sent` è terminale (`ALLOWED_TRANSITIONS.sent = []`): chiuderla
+  // lì lascerebbe l'operatore con una newsletter "inviata" che nessuno ha
+  // ricevuto e nessun modo di riprovare.
+  if (!deliveredSomething(totals, newsletter.stats?.requested ?? 0)) {
+    const reason = totals.failed
+      ? `Nessuna email inviata: ${totals.failed} destinatari in errore ` +
+        `(${totals.failedBatches} batch falliti).`
+      : 'Nessuna email inviata: nessun destinatario era ancora contattabile al momento della spedizione.';
+    const failed = await transitionNewsletter(newsletterId, 'failed', {
+      expected: ['sending'],
+      strict: false,
+      patch: { failureReason: reason, completedAt },
+    });
+    if (!failed) return false;
+
+    await logActivity({
+      action: 'newsletter.completed',
+      entityType: 'newsletter',
+      entityId: newsletterId,
+      userId: null,
+      summary: `Spedizione fallita: ${reason}`,
+      metadata: { failedBatches: totals.failedBatches, failed: totals.failed, sent: 0 },
+      severity: 'error',
+    });
+    return true;
+  }
+
   const updated = await transitionNewsletter(newsletterId, 'sent', {
     expected: ['sending'],
     strict: false,
@@ -862,17 +1052,16 @@ export async function finalizeNewsletterIfComplete(newsletterId: DocId): Promise
   });
   if (!updated) return false;
 
-  const failedBatches = await batchesOf(newsletterId, ['failed']);
   await logActivity({
     action: 'newsletter.completed',
     entityType: 'newsletter',
     entityId: newsletterId,
     userId: null,
-    summary: failedBatches.length
-      ? `Spedizione completata con ${failedBatches.length} batch in errore`
+    summary: totals.failedBatches
+      ? `Spedizione completata con ${totals.failedBatches} batch in errore`
       : 'Spedizione completata',
-    metadata: { failedBatches: failedBatches.length },
-    severity: failedBatches.length ? 'warning' : 'info',
+    metadata: { failedBatches: totals.failedBatches, failed: totals.failed, sent: totals.sent },
+    severity: totals.failedBatches ? 'warning' : 'info',
   });
   return true;
 }

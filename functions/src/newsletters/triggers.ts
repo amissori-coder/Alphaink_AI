@@ -27,6 +27,7 @@ import { createLogger } from '../lib/logger';
 import { estimateAudienceSize } from '../clusters';
 import { loadNewsletterEnvironment, renderNewsletterMaster } from './compose';
 import { audienceSignature, contentSignature } from './repository';
+import { hasPreparedQueue } from './sender';
 
 const log = createLogger('newsletters.triggers');
 
@@ -36,6 +37,17 @@ const log = createLogger('newsletters.triggers');
  * un'email diversa da quelli del primo.
  */
 const FROZEN_STATUSES: NewsletterStatus[] = ['queued', 'sending', 'sent'];
+
+/**
+ * Anche la pausa congela il contenuto, ma solo a coda già preparata: i batch
+ * sospesi ripartiranno con l'HTML salvato qui, e cambiarlo significherebbe
+ * spedire due versioni diverse della stessa campagna. Una pausa arrivata prima
+ * della preparazione non ha destinatari già serviti e resta modificabile.
+ */
+function isContentFrozen(newsletter: Newsletter): boolean {
+  if (FROZEN_STATUSES.includes(newsletter.status)) return true;
+  return newsletter.status === 'paused' && hasPreparedQueue(newsletter);
+}
 
 export const onNewsletterWritten = onDocumentWritten(
   {
@@ -61,7 +73,7 @@ export const onNewsletterWritten = onDocumentWritten(
     const raw = serializeDoc<Record<string, unknown>>(afterSnapshot.data() ?? {});
     const newsletter = withId<Newsletter>(afterSnapshot);
 
-    if (FROZEN_STATUSES.includes(newsletter.status)) {
+    if (isContentFrozen(newsletter)) {
       log.debug('Contenuto congelato: nessuna rigenerazione', {
         newsletterId,
         status: newsletter.status,
