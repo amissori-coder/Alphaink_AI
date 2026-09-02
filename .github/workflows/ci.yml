@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build e typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Installazione dipendenze
+        run: npm ci --no-audit --no-fund
+
+      - name: Build pacchetto condiviso
+        run: npm run build:shared
+
+      - name: Build Cloud Functions
+        run: npm run build --workspace=functions
+
+      - name: Typecheck web app
+        run: npm run typecheck --workspace=@alphaink/web
+
+      - name: Build web app
+        run: npm run build --workspace=@alphaink/web
+        env:
+          # Valori fittizi: il build di Next non contatta Firebase.
+          NEXT_PUBLIC_FIREBASE_API_KEY: ci-placeholder
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ci.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: ci-project
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: ci-project.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: '000000000000'
+          NEXT_PUBLIC_FIREBASE_APP_ID: '1:000000000000:web:0000000000000000000000'
+          NEXT_PUBLIC_FUNCTIONS_REGION: europe-west1
+          NEXT_PUBLIC_APP_URL: https://newsletter.alphaink.net
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build:shared
+      - run: npm run lint --workspace=@alphaink/web
